@@ -271,15 +271,15 @@ def test_det_defaults_match_explicit():
         assert len(default) > 50
 
 
-def test_det_rapid_triplet_shifts_output():
+def test_det_knobs_shift_output():
     data = _small()
     eng_default = faster_paddle.OcrEngine(model_size="tiny", threads=2)
-    eng_rapid = faster_paddle.OcrEngine(
+    eng_custom = faster_paddle.OcrEngine(
         model_size="tiny", threads=2,
         det_thresh=0.3, det_box_thresh=0.5, det_unclip_ratio=1.6,
         det_max_candidates=1000, text_score=0.5,
     )
-    assert _signature(eng_default.ocr(data)) != _signature(eng_rapid.ocr(data))
+    assert _signature(eng_default.ocr(data)) != _signature(eng_custom.ocr(data))
 
 
 def test_det_config_round_trips():

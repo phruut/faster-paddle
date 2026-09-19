@@ -494,8 +494,8 @@ impl OcrEngine {
     ///     det_thresh: prob-map threshold (default 0.2).
     ///     det_box_thresh: box-score threshold (default 0.40 tiny, 0.45 small/medium).
     ///     det_unclip_ratio: unclip expansion ratio (default 1.4).
-    ///     det_max_candidates: max det boxes kept (default 3000, rapid uses 1000).
-    ///     text_score: drop reads below this conf (default 0.0 keep-all, rapid uses 0.5).
+    ///     det_max_candidates: max det boxes kept (default 3000).
+    ///     text_score: drop reads below this conf (default 0.0 keep-all).
     #[new]
     #[pyo3(signature = (model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_min_side=None, rec_min_width=None, det_thresh=None, det_box_thresh=None, det_unclip_ratio=None, det_max_candidates=None, text_score=None))]
     #[allow(clippy::too_many_arguments)]
