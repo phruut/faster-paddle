@@ -461,6 +461,37 @@ fn run_ocr_batch(
     Ok(output)
 }
 
+/// Decode crops and read each one in order; `(text, confidence)` per crop, unfiltered.
+fn run_rec(engine: &Mutex<Engine>, crops: &[PyBackedBytes]) -> Result<Vec<(String, f32)>, String> {
+    use rayon::prelude::*;
+    if crops.is_empty() {
+        return Ok(Vec::new());
+    }
+    let workers = engine.lock().map_err(|e| e.to_string())?.workers.clone();
+    let imgs: Result<Vec<ImageRgb>, String> = workers.install(|| {
+        crops
+            .par_iter()
+            .enumerate()
+            .map(|(i, bytes)| decode_rgb(bytes).map_err(|e| format!("crop {i}: {e}")))
+            .collect()
+    });
+    engine
+        .lock()
+        .map_err(|e| e.to_string())?
+        .rec(&imgs?)
+        .map_err(|e| e.to_string())
+}
+
+/// Detect text boxes without recognizing; boxes are in source-image coordinates.
+fn run_det(engine: &Mutex<Engine>, image: &[u8]) -> Result<Vec<[i32; 4]>, String> {
+    let img = decode_rgb(image)?;
+    engine
+        .lock()
+        .map_err(|e| e.to_string())?
+        .det(&img)
+        .map_err(|e| e.to_string())
+}
+
 fn build_dict<'py>(py: Python<'py>, raw: RawResult) -> PyResult<Bound<'py, PyDict>> {
     let (text, structured, items) = raw;
     let out = PyDict::new(py);
@@ -575,6 +606,42 @@ impl OcrEngine {
             .allow_threads(|| run_ocr_batch(&self.inner, &images, opts, batch_size))
             .map_err(PyRuntimeError::new_err)?;
         raw.into_iter().map(|r| build_dict(py, r)).collect()
+    }
+
+    /// Read pre-cropped line images; `[{"text", "confidence"}]` in input order.
+    #[pyo3(signature = (crops))]
+    fn rec<'py>(
+        &self,
+        py: Python<'py>,
+        crops: Vec<PyBackedBytes>,
+    ) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let raw = py
+            .allow_threads(|| run_rec(&self.inner, &crops))
+            .map_err(PyRuntimeError::new_err)?;
+        raw.into_iter()
+            .map(|(t, conf)| {
+                let d = PyDict::new(py);
+                d.set_item("text", t)?;
+                d.set_item("confidence", conf)?;
+                Ok(d)
+            })
+            .collect()
+    }
+
+    /// Find text boxes without reading; pairs with `rec` to split stages across engines.
+    #[pyo3(signature = (image))]
+    fn det<'py>(&self, py: Python<'py>, image: &[u8]) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let raw = py
+            .allow_threads(|| run_det(&self.inner, image))
+            .map_err(PyRuntimeError::new_err)?;
+        raw.into_iter()
+            .map(|b| {
+                let d = PyDict::new(py);
+                d.set_item("topLeftCoord", PyTuple::new(py, [b[0], b[1]])?)?;
+                d.set_item("bottomRightCoord", PyTuple::new(py, [b[2], b[3]])?)?;
+                Ok(d)
+            })
+            .collect()
     }
 
     /// Resolved CPU and input-shape settings for diagnostics and reproducibility.

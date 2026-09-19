@@ -307,6 +307,21 @@ impl Engine {
         })
     }
 
+    /// Read pre-cropped lines without detecting; `(text, confidence)` per crop, in order.
+    pub fn rec(&mut self, crops: &[ImageRgb]) -> ort::Result<Vec<(String, f32)>> {
+        let workers = Arc::clone(&self.workers);
+        workers.install(|| self.recognize_texts(crops))
+    }
+
+    /// Find text boxes without reading; axis-aligned `[l, t, r, b]`, source coords.
+    pub fn det(&mut self, img: &ImageRgb) -> ort::Result<Vec<[i32; 4]>> {
+        let workers = Arc::clone(&self.workers);
+        workers.install(|| {
+            let (_crops, boxes) = self.detect_crops(img)?;
+            Ok(boxes.iter().map(quad_to_box4).collect())
+        })
+    }
+
     fn detect_crops(&mut self, img: &ImageRgb) -> ort::Result<(Vec<ImageRgb>, Vec<[cv::Pt; 4]>)> {
         let dbg = std::env::var("OCR_DEBUG").is_ok();
         let t0 = std::time::Instant::now();
@@ -421,6 +436,27 @@ impl Engine {
         crops: &[ImageRgb],
         kept_boxes: &[[cv::Pt; 4]],
     ) -> ort::Result<Vec<OcrResult>> {
+        let texts = self.recognize_texts(crops)?;
+        // drop low-conf reads when text_score > 0, else keep all
+        let mut out = Vec::with_capacity(crops.len());
+        let thresh = self.text_score;
+        for ((t, sc), q) in texts.into_iter().zip(kept_boxes) {
+            if sc < thresh {
+                continue;
+            }
+            if thresh > 0.0 && t.trim().is_empty() {
+                continue;
+            }
+            out.push(OcrResult {
+                text: t,
+                score: sc,
+                box4: quad_to_box4(q),
+            });
+        }
+        Ok(out)
+    }
+
+    fn recognize_texts(&mut self, crops: &[ImageRgb]) -> ort::Result<Vec<(String, f32)>> {
         use rayon::prelude::*;
         if crops.is_empty() {
             return Ok(Vec::new());
@@ -485,27 +521,7 @@ impl Engine {
                 t3.elapsed().as_secs_f64()
             );
         }
-        // drop low-conf reads when text_score > 0, else keep all
-        let mut out = Vec::with_capacity(crops.len());
-        let thresh = self.text_score;
-        for ((t, sc), q) in texts.into_iter().zip(kept_boxes) {
-            if sc < thresh {
-                continue;
-            }
-            if thresh > 0.0 && t.trim().is_empty() {
-                continue;
-            }
-            let left = q.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
-            let right = q.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
-            let top = q.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
-            let bottom = q.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
-            out.push(OcrResult {
-                text: t,
-                score: sc,
-                box4: [left as i32, top as i32, right as i32, bottom as i32],
-            });
-        }
-        Ok(out)
+        Ok(texts)
     }
 }
 
@@ -952,6 +968,15 @@ fn sort_boxes(mut boxes: Vec<[cv::Pt; 4]>) -> Vec<[cv::Pt; 4]> {
         }
     }
     boxes
+}
+
+/// Axis-aligned bounding box of a quad, in source-image coordinates.
+fn quad_to_box4(q: &[cv::Pt; 4]) -> [i32; 4] {
+    let left = q.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+    let right = q.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+    let top = q.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+    let bottom = q.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+    [left as i32, top as i32, right as i32, bottom as i32]
 }
 
 /// get_minarea_rect_crop + get_rotate_crop_image.

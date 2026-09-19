@@ -363,6 +363,51 @@ def test_det_use_dilation_config_and_batch():
     assert eng.ocr_batch([data, data]) == [expected, expected]
 
 
+def test_rec_only_reads_precropped_lines():
+    import pytest
+    eng = faster_paddle.OcrEngine(model_size="tiny", threads=2)
+    assert eng.rec([]) == []
+    data = _small()
+    full = eng.ocr(data)
+    items = list(full["bounds"].values())[:3]
+    assert len(items) == 3
+    # cut axis-aligned crops from the source image and read them without det
+    src = Image.open(io.BytesIO(data)).convert("RGB")
+    crops = []
+    for b in items:
+        x1, y1 = b["topLeftCoord"]
+        x2, y2 = b["bottomRightCoord"]
+        crop = src.crop((max(0, x1), max(0, y1), max(x1 + 1, x2), max(y1 + 1, y2)))
+        buf = io.BytesIO()
+        crop.save(buf, format="PNG")
+        crops.append(buf.getvalue())
+    out = eng.rec(crops)
+    assert len(out) == len(crops)
+    for entry in out:
+        assert set(entry.keys()) == {"text", "confidence"}
+    assert [e["text"] for e in out] == [b["text"] for b in items]
+    assert out == eng.rec(crops)  # deterministic
+    with pytest.raises(RuntimeError, match="crop 1"):
+        eng.rec([crops[0], b"invalid"])
+
+
+def test_det_only_matches_ocr_boxes():
+    import pytest
+    eng = faster_paddle.OcrEngine(model_size="tiny", threads=2)
+    data = _small()
+    full = eng.ocr(data)
+    boxes = eng.det(data)
+    assert len(boxes) > 50
+    assert len(boxes) == len(full["bounds"])
+    for det_b, ocr_b in zip(boxes, full["bounds"].values()):
+        assert set(det_b.keys()) == {"topLeftCoord", "bottomRightCoord"}
+        assert det_b["topLeftCoord"] == ocr_b["topLeftCoord"]
+        assert det_b["bottomRightCoord"] == ocr_b["bottomRightCoord"]
+    assert boxes == eng.det(data)  # deterministic
+    with pytest.raises(RuntimeError):
+        eng.det(b"invalid")
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
