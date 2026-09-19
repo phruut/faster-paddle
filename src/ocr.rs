@@ -71,6 +71,7 @@ pub struct Engine {
     det_unclip_ratio: f64,
     det_max_candidates: usize,
     text_score: f32,
+    det_use_dilation: bool,
     det_max_side: i64,
 }
 
@@ -99,6 +100,7 @@ impl Engine {
         det_unclip_ratio: f64,
         det_max_candidates: usize,
         text_score: f32,
+        det_use_dilation: bool,
         rec_pool: usize,
         det_max_side: i64,
     ) -> ort::Result<Self> {
@@ -228,6 +230,7 @@ impl Engine {
             det_unclip_ratio,
             det_max_candidates,
             text_score,
+            det_use_dilation,
             det_max_side: if det_max_side <= 0 {
                 MAX_SIDE_LIMIT
             } else {
@@ -263,6 +266,7 @@ impl Engine {
             ("det_min_side", self.det_min_side as usize),
             ("det_max_side", self.det_max_side as usize),
             ("det_max_candidates", self.det_max_candidates),
+            ("det_use_dilation", usize::from(self.det_use_dilation)),
         ]
     }
 
@@ -343,6 +347,7 @@ impl Engine {
         let det_thresh = self.det_thresh;
         let det_unclip_ratio = self.det_unclip_ratio;
         let det_max_candidates = self.det_max_candidates;
+        let det_use_dilation = self.det_use_dilation;
         // post-process directly on the borrowed output tensor (the prob map is
         // several MB; no need to copy it out)
         let t1;
@@ -373,6 +378,7 @@ impl Engine {
                 det_thresh,
                 det_unclip_ratio,
                 det_max_candidates,
+                det_use_dilation,
             )
         };
         let boxes = sort_boxes(boxes);
@@ -843,6 +849,28 @@ fn component_extrema(fg: &mut [u8], w: usize, h: usize, limit: usize) -> Vec<Vec
     components
 }
 
+/// 2x2 OR-dilate matching rapid's `use_dilation` (`cv2.dilate` with a
+/// 2x2 ones kernel): each output pixel covers its 2x2 input neighbourhood.
+fn dilate_2x2(fg: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; fg.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let mut v = fg[y * w + x];
+            if x > 0 {
+                v |= fg[y * w + x - 1];
+            }
+            if y > 0 {
+                v |= fg[(y - 1) * w + x];
+            }
+            if x > 0 && y > 0 {
+                v |= fg[(y - 1) * w + x - 1];
+            }
+            out[y * w + x] = v;
+        }
+    }
+    out
+}
+
 /// DB post-process. Returns quad boxes in source-image coordinates.
 #[allow(clippy::too_many_arguments)]
 fn db_postprocess(
@@ -855,9 +883,13 @@ fn db_postprocess(
     det_thresh: f32,
     det_unclip_ratio: f64,
     det_max_candidates: usize,
+    det_use_dilation: bool,
 ) -> Vec<[cv::Pt; 4]> {
     use rayon::prelude::*;
     let mut fg: Vec<u8> = pred.par_iter().map(|&v| u8::from(v > det_thresh)).collect();
+    if det_use_dilation {
+        fg = dilate_2x2(&fg, pw, ph);
+    }
     let components = component_extrema(&mut fg, pw, ph, det_max_candidates);
 
     let width_scale = src_w as f64 / pw as f64;
@@ -978,6 +1010,22 @@ fn crop_quad(img: &ImageRgb, quad: &[cv::Pt; 4]) -> Option<ImageRgb> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dilation_merges_gapped_components() {
+        // two 2x2 blocks with a one-pixel gap stay separate, merge with dilate
+        let (w, h) = (5, 2);
+        let fg = vec![1, 1, 0, 1, 1, 1, 1, 0, 1, 1];
+        assert_eq!(
+            component_extrema(&mut fg.clone(), w, h, usize::MAX).len(),
+            2
+        );
+        let d = dilate_2x2(&fg, w, h);
+        assert_eq!(component_extrema(&mut d.clone(), w, h, usize::MAX).len(), 1);
+        // single pixel expands down-right into a 2x2 block
+        let d3 = dilate_2x2(&[1, 0, 0, 0, 0, 0, 0, 0, 0], 3, 3);
+        assert_eq!(d3, vec![1, 1, 0, 1, 1, 0, 0, 0, 0]);
+    }
 
     #[test]
     fn scanline_components_preserve_pixel_hulls() {

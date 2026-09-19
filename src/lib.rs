@@ -237,6 +237,12 @@ fn env_float(name: &str) -> Option<f64> {
     std::env::var(name).ok()?.parse::<f64>().ok()
 }
 
+fn env_bool(name: &str) -> Option<bool> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn new_engine(
     model_size: &str,
@@ -250,6 +256,7 @@ fn new_engine(
     det_unclip_ratio: Option<f64>,
     det_max_candidates: Option<usize>,
     text_score: Option<f32>,
+    det_use_dilation: Option<bool>,
 ) -> PyResult<Engine> {
     if threads == Some(0) || rec_batch == Some(0) {
         return Err(PyValueError::new_err(
@@ -298,6 +305,9 @@ fn new_engine(
             "text_score must be between 0.0 and 1.0",
         ));
     }
+    let det_use_dilation = det_use_dilation
+        .or_else(|| env_bool("OCR_DET_USE_DILATION"))
+        .unwrap_or(false);
     let t = threads
         .or_else(|| env_usize("OCR_THREADS"))
         .unwrap_or_else(hardware::physical_cores)
@@ -329,6 +339,7 @@ fn new_engine(
         det_unclip_ratio,
         det_max_candidates,
         text_score,
+        det_use_dilation,
         pool,
         det_max,
     )
@@ -496,8 +507,9 @@ impl OcrEngine {
     ///     det_unclip_ratio: unclip expansion ratio (default 1.4).
     ///     det_max_candidates: max det boxes kept (default 3000).
     ///     text_score: drop reads below this conf (default 0.0 keep-all).
+    ///     det_use_dilation: 2x2 mask dilate before components (default False).
     #[new]
-    #[pyo3(signature = (model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_min_side=None, rec_min_width=None, det_thresh=None, det_box_thresh=None, det_unclip_ratio=None, det_max_candidates=None, text_score=None))]
+    #[pyo3(signature = (model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_min_side=None, rec_min_width=None, det_thresh=None, det_box_thresh=None, det_unclip_ratio=None, det_max_candidates=None, text_score=None, det_use_dilation=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -512,6 +524,7 @@ impl OcrEngine {
         det_unclip_ratio: Option<f64>,
         det_max_candidates: Option<usize>,
         text_score: Option<f32>,
+        det_use_dilation: Option<bool>,
     ) -> PyResult<Self> {
         // Model construction and downloads run without holding the GIL.
         let size = model_size.to_string();
@@ -528,6 +541,7 @@ impl OcrEngine {
                 det_unclip_ratio,
                 det_max_candidates,
                 text_score,
+                det_use_dilation,
             )
         })?;
         Ok(Self {
@@ -689,7 +703,9 @@ fn default_engine() -> PyResult<&'static Mutex<Engine>> {
     if let Some(e) = DEFAULT_ENGINE.get() {
         return Ok(e);
     }
-    let eng = new_engine("tiny", None, None, None, None, None, None, None, None, None, None)?;
+    let eng = new_engine(
+        "tiny", None, None, None, None, None, None, None, None, None, None, None,
+    )?;
     Ok(DEFAULT_ENGINE.get_or_init(|| Mutex::new(eng)))
 }
 

@@ -350,6 +350,19 @@ def test_text_score_filters_low_conf():
         assert b["text"].strip() != ""
 
 
+def test_det_use_dilation_config_and_batch():
+    data = _small()
+    default = faster_paddle.OcrEngine(model_size="tiny", threads=2)
+    assert default.config["det_use_dilation"] == 0
+    explicit = faster_paddle.OcrEngine(model_size="tiny", threads=2, det_use_dilation=False)
+    assert _signature(explicit.ocr(data)) == _signature(default.ocr(data))
+    eng = faster_paddle.OcrEngine(model_size="tiny", threads=2, det_use_dilation=True)
+    assert eng.config["det_use_dilation"] == 1
+    expected = eng.ocr(data)
+    assert expected["bounds"]
+    assert eng.ocr_batch([data, data]) == [expected, expected]
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
