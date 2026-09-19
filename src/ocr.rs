@@ -10,9 +10,10 @@ use std::sync::{
 };
 
 // ---- detection params (from PP-OCRv6 *_det inference.yml) ----
-const DET_THRESH: f32 = 0.2;
-const DET_UNCLIP_RATIO: f64 = 1.4;
-const DET_MAX_CANDIDATES: usize = 3000;
+pub const DET_THRESH: f32 = 0.2;
+pub const DET_UNCLIP_RATIO: f64 = 1.4;
+pub const DET_MAX_CANDIDATES: usize = 3000;
+pub const TEXT_SCORE: f32 = 0.0;
 const DET_MIN_SIZE: f64 = 3.0;
 const LIMIT_SIDE_LEN: i64 = 736;
 const MAX_SIDE_LIMIT: i64 = 4000;
@@ -66,6 +67,10 @@ pub struct Engine {
     chars: Vec<String>,
     rec_batch: usize,
     box_thresh: f32,
+    det_thresh: f32,
+    det_unclip_ratio: f64,
+    det_max_candidates: usize,
+    text_score: f32,
     det_max_side: i64,
 }
 
@@ -90,6 +95,10 @@ impl Engine {
         det_threads: usize,
         rec_batch: usize,
         box_thresh: f32,
+        det_thresh: f32,
+        det_unclip_ratio: f64,
+        det_max_candidates: usize,
+        text_score: f32,
         rec_pool: usize,
         det_max_side: i64,
     ) -> ort::Result<Self> {
@@ -215,6 +224,10 @@ impl Engine {
             chars,
             rec_batch: rec_batch.max(1),
             box_thresh,
+            det_thresh,
+            det_unclip_ratio,
+            det_max_candidates,
+            text_score,
             det_max_side: if det_max_side <= 0 {
                 MAX_SIDE_LIMIT
             } else {
@@ -249,6 +262,16 @@ impl Engine {
             ("rec_min_width", self.rec_min_width),
             ("det_min_side", self.det_min_side as usize),
             ("det_max_side", self.det_max_side as usize),
+            ("det_max_candidates", self.det_max_candidates),
+        ]
+    }
+
+    pub fn det_settings(&self) -> Vec<(&'static str, f64)> {
+        vec![
+            ("det_thresh", self.det_thresh as f64),
+            ("det_box_thresh", self.box_thresh as f64),
+            ("det_unclip_ratio", self.det_unclip_ratio),
+            ("text_score", self.text_score as f64),
         ]
     }
 
@@ -317,6 +340,9 @@ impl Engine {
         let tinf = std::time::Instant::now();
         let tensor = TensorRef::from_array_view(([1usize, 3, rh, rw], input.as_slice()))?;
         let box_thresh = self.box_thresh;
+        let det_thresh = self.det_thresh;
+        let det_unclip_ratio = self.det_unclip_ratio;
+        let det_max_candidates = self.det_max_candidates;
         // post-process directly on the borrowed output tensor (the prob map is
         // several MB; no need to copy it out)
         let t1;
@@ -337,7 +363,17 @@ impl Engine {
                 );
             }
             t1 = std::time::Instant::now();
-            db_postprocess(pred, pw, ph, img.w, img.h, box_thresh)
+            db_postprocess(
+                pred,
+                pw,
+                ph,
+                img.w,
+                img.h,
+                box_thresh,
+                det_thresh,
+                det_unclip_ratio,
+                det_max_candidates,
+            )
         };
         let boxes = sort_boxes(boxes);
         if dbg {
@@ -443,9 +479,16 @@ impl Engine {
                 t3.elapsed().as_secs_f64()
             );
         }
-        // assemble results (score_thresh = 0.0 -> keep all)
+        // drop low-conf reads when text_score > 0, else keep all
         let mut out = Vec::with_capacity(crops.len());
+        let thresh = self.text_score;
         for ((t, sc), q) in texts.into_iter().zip(kept_boxes) {
+            if sc < thresh {
+                continue;
+            }
+            if thresh > 0.0 && t.trim().is_empty() {
+                continue;
+            }
             let left = q.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
             let right = q.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
             let top = q.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
@@ -801,6 +844,7 @@ fn component_extrema(fg: &mut [u8], w: usize, h: usize, limit: usize) -> Vec<Vec
 }
 
 /// DB post-process. Returns quad boxes in source-image coordinates.
+#[allow(clippy::too_many_arguments)]
 fn db_postprocess(
     pred: &[f32],
     pw: usize,
@@ -808,10 +852,13 @@ fn db_postprocess(
     src_w: usize,
     src_h: usize,
     box_thresh: f32,
+    det_thresh: f32,
+    det_unclip_ratio: f64,
+    det_max_candidates: usize,
 ) -> Vec<[cv::Pt; 4]> {
     use rayon::prelude::*;
-    let mut fg: Vec<u8> = pred.par_iter().map(|&v| u8::from(v > DET_THRESH)).collect();
-    let components = component_extrema(&mut fg, pw, ph, DET_MAX_CANDIDATES);
+    let mut fg: Vec<u8> = pred.par_iter().map(|&v| u8::from(v > det_thresh)).collect();
+    let components = component_extrema(&mut fg, pw, ph, det_max_candidates);
 
     let width_scale = src_w as f64 / pw as f64;
     let height_scale = src_h as f64 / ph as f64;
@@ -832,7 +879,7 @@ fn db_postprocess(
             if perim < 1e-6 {
                 return None;
             }
-            let dist = area * DET_UNCLIP_RATIO / perim;
+            let dist = area * det_unclip_ratio / perim;
             let box2 = cv::unclip_rect(&box1, dist);
             let (box3, side3) = cv::min_area_rect(&box2);
             if side3 < DET_MIN_SIZE + 2.0 {

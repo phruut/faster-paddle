@@ -252,6 +252,104 @@ def test_sparse_wide_jobs_match_batch_text_and_boxes():
         assert cfg["wide_rec_workers"] * cfg["wide_rec_threads"] <= cfg["threads"]
 
 
+def _signature(r):
+    return [(b["topLeftCoord"], b["bottomRightCoord"], b["text"]) for b in r["bounds"].values()]
+
+
+def test_det_defaults_match_explicit():
+    data = _small()
+    for size, box in (("tiny", 0.40), ("small", 0.45)):
+        default = _signature(faster_paddle.OcrEngine(model_size=size, threads=2).ocr(data))
+        explicit = _signature(
+            faster_paddle.OcrEngine(
+                model_size=size, threads=2,
+                det_thresh=0.2, det_box_thresh=box, det_unclip_ratio=1.4,
+                det_max_candidates=3000, text_score=0.0,
+            ).ocr(data)
+        )
+        assert default == explicit
+        assert len(default) > 50
+
+
+def test_det_rapid_triplet_shifts_output():
+    data = _small()
+    eng_default = faster_paddle.OcrEngine(model_size="tiny", threads=2)
+    eng_rapid = faster_paddle.OcrEngine(
+        model_size="tiny", threads=2,
+        det_thresh=0.3, det_box_thresh=0.5, det_unclip_ratio=1.6,
+        det_max_candidates=1000, text_score=0.5,
+    )
+    assert _signature(eng_default.ocr(data)) != _signature(eng_rapid.ocr(data))
+
+
+def test_det_config_round_trips():
+    import pytest
+    eng = faster_paddle.OcrEngine(
+        model_size="tiny", threads=2,
+        det_thresh=0.3, det_box_thresh=0.5, det_unclip_ratio=1.6,
+        det_max_candidates=1000, text_score=0.5,
+    )
+    cfg = eng.config
+    assert cfg["det_thresh"] == pytest.approx(0.3)
+    assert cfg["det_box_thresh"] == pytest.approx(0.5)
+    assert cfg["det_unclip_ratio"] == pytest.approx(1.6)
+    assert cfg["det_max_candidates"] == 1000
+    assert cfg["text_score"] == pytest.approx(0.5)
+    defaults = faster_paddle.OcrEngine(model_size="tiny", threads=2).config
+    assert defaults["det_thresh"] == pytest.approx(0.2)
+    assert defaults["det_box_thresh"] == pytest.approx(0.40)
+    assert defaults["det_unclip_ratio"] == pytest.approx(1.4)
+    assert defaults["det_max_candidates"] == 3000
+    assert defaults["text_score"] == pytest.approx(0.0)
+
+
+def test_det_invalid_values():
+    import pytest
+    for kw in ({"det_thresh": -0.1}, {"det_thresh": 1.5},
+               {"det_box_thresh": -0.1}, {"det_box_thresh": 1.5},
+               {"det_unclip_ratio": -1.0}, {"det_unclip_ratio": 5.5},
+               {"det_max_candidates": 0}, {"det_max_candidates": 10001},
+               {"text_score": -0.1}, {"text_score": 1.5}):
+        with pytest.raises(ValueError):
+            faster_paddle.OcrEngine(**kw)
+
+
+def test_det_batch_respects_knobs():
+    data = _small()
+    eng = faster_paddle.OcrEngine(
+        model_size="tiny", threads=2,
+        det_thresh=0.3, det_box_thresh=0.5, det_unclip_ratio=1.6,
+        det_max_candidates=1000, text_score=0.5,
+    )
+    expected = eng.ocr(data)
+    assert eng.ocr_batch([data, data]) == [expected, expected]
+    default = faster_paddle.OcrEngine(model_size="tiny", threads=2).ocr(data)
+    assert _signature(expected) != _signature(default)
+
+
+def test_det_max_candidates_limits_boxes():
+    data = _small()
+    full = faster_paddle.OcrEngine(model_size="tiny", threads=2).ocr(data)
+    tiny = faster_paddle.OcrEngine(
+        model_size="tiny", threads=2, det_max_candidates=10,
+    ).ocr(data)
+    assert len(tiny["bounds"]) <= 10
+    assert len(tiny["bounds"]) < len(full["bounds"])
+
+
+def test_text_score_filters_low_conf():
+    data = _small()
+    full = faster_paddle.OcrEngine(model_size="tiny", threads=2).ocr(data)
+    filtered = faster_paddle.OcrEngine(
+        model_size="tiny", threads=2, text_score=0.5,
+    ).ocr(data)
+    assert len(filtered["bounds"]) <= len(full["bounds"])
+    assert _signature(filtered) != _signature(full)
+    for b in filtered["bounds"].values():
+        assert b["confidence"] >= 0.5 - 1e-6
+        assert b["text"].strip() != ""
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

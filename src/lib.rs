@@ -233,6 +233,11 @@ fn env_usize(name: &str) -> Option<usize> {
         .filter(|&n| n > 0)
 }
 
+fn env_float(name: &str) -> Option<f64> {
+    std::env::var(name).ok()?.parse::<f64>().ok()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn new_engine(
     model_size: &str,
     threads: Option<usize>,
@@ -240,6 +245,11 @@ fn new_engine(
     det_max_side: Option<i64>,
     det_min_side: Option<i64>,
     rec_min_width: Option<usize>,
+    det_thresh: Option<f32>,
+    det_box_thresh: Option<f32>,
+    det_unclip_ratio: Option<f64>,
+    det_max_candidates: Option<usize>,
+    text_score: Option<f32>,
 ) -> PyResult<Engine> {
     if threads == Some(0) || rec_batch == Some(0) {
         return Err(PyValueError::new_err(
@@ -256,6 +266,38 @@ fn new_engine(
             "rec_min_width must be between 64 and 3200",
         ));
     }
+    let det_thresh = det_thresh
+        .or_else(|| env_float("OCR_DET_THRESH").map(|v| v as f32))
+        .unwrap_or(ocr::DET_THRESH);
+    if !(0.0..=1.0).contains(&det_thresh) {
+        return Err(PyValueError::new_err(
+            "det_thresh must be between 0.0 and 1.0",
+        ));
+    }
+    let det_unclip_ratio = det_unclip_ratio
+        .or_else(|| env_float("OCR_DET_UNCLIP_RATIO"))
+        .unwrap_or(ocr::DET_UNCLIP_RATIO);
+    if !(0.0..=5.0).contains(&det_unclip_ratio) {
+        return Err(PyValueError::new_err(
+            "det_unclip_ratio must be between 0.0 and 5.0",
+        ));
+    }
+    let det_max_candidates = det_max_candidates
+        .or_else(|| env_usize("OCR_DET_MAX_CANDIDATES"))
+        .unwrap_or(ocr::DET_MAX_CANDIDATES);
+    if !(1..=10000).contains(&det_max_candidates) {
+        return Err(PyValueError::new_err(
+            "det_max_candidates must be between 1 and 10000",
+        ));
+    }
+    let text_score = text_score
+        .or_else(|| env_float("OCR_TEXT_SCORE").map(|v| v as f32))
+        .unwrap_or(ocr::TEXT_SCORE);
+    if !(0.0..=1.0).contains(&text_score) {
+        return Err(PyValueError::new_err(
+            "text_score must be between 0.0 and 1.0",
+        ));
+    }
     let t = threads
         .or_else(|| env_usize("OCR_THREADS"))
         .unwrap_or_else(hardware::physical_cores)
@@ -267,6 +309,14 @@ fn new_engine(
         .unwrap_or(t.min(if model_size == "medium" { 8 } else { 32 }))
         .clamp(1, t);
     let m = resolve_model(model_size)?;
+    let det_box_thresh = det_box_thresh
+        .or_else(|| env_float("OCR_DET_BOX_THRESH").map(|v| v as f32))
+        .unwrap_or(m.box_thresh);
+    if !(0.0..=1.0).contains(&det_box_thresh) {
+        return Err(PyValueError::new_err(
+            "det_box_thresh must be between 0.0 and 1.0",
+        ));
+    }
     let mut engine = Engine::from_memory(
         &m.det,
         &m.rec,
@@ -274,7 +324,11 @@ fn new_engine(
         t,
         det_t,
         rb,
-        m.box_thresh,
+        det_box_thresh,
+        det_thresh,
+        det_unclip_ratio,
+        det_max_candidates,
+        text_score,
         pool,
         det_max,
     )
@@ -437,8 +491,14 @@ impl OcrEngine {
     ///         minimum-side upscaling, with multiple-of-32 rounding retained).
     ///     rec_min_width: padding floor (tiny=64, small=96, medium=320).
     ///         Use 320 for reference padding. Changes can affect recognition.
+    ///     det_thresh: prob-map threshold (default 0.2).
+    ///     det_box_thresh: box-score threshold (default 0.40 tiny, 0.45 small/medium).
+    ///     det_unclip_ratio: unclip expansion ratio (default 1.4).
+    ///     det_max_candidates: max det boxes kept (default 3000, rapid uses 1000).
+    ///     text_score: drop reads below this conf (default 0.0 keep-all, rapid uses 0.5).
     #[new]
-    #[pyo3(signature = (model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_min_side=None, rec_min_width=None))]
+    #[pyo3(signature = (model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_min_side=None, rec_min_width=None, det_thresh=None, det_box_thresh=None, det_unclip_ratio=None, det_max_candidates=None, text_score=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         model_size: &str,
@@ -447,6 +507,11 @@ impl OcrEngine {
         det_max_side: Option<i64>,
         det_min_side: Option<i64>,
         rec_min_width: Option<usize>,
+        det_thresh: Option<f32>,
+        det_box_thresh: Option<f32>,
+        det_unclip_ratio: Option<f64>,
+        det_max_candidates: Option<usize>,
+        text_score: Option<f32>,
     ) -> PyResult<Self> {
         // Model construction and downloads run without holding the GIL.
         let size = model_size.to_string();
@@ -458,6 +523,11 @@ impl OcrEngine {
                 det_max_side,
                 det_min_side,
                 rec_min_width,
+                det_thresh,
+                det_box_thresh,
+                det_unclip_ratio,
+                det_max_candidates,
+                text_score,
             )
         })?;
         Ok(Self {
@@ -496,16 +566,19 @@ impl OcrEngine {
     /// Resolved CPU and input-shape settings for diagnostics and reproducibility.
     #[getter]
     fn config<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let settings = py
+        let (settings, det_settings) = py
             .allow_threads(|| {
                 self.inner
                     .lock()
-                    .map(|e| e.settings())
+                    .map(|e| (e.settings(), e.det_settings()))
                     .map_err(|e| e.to_string())
             })
             .map_err(PyRuntimeError::new_err)?;
         let out = PyDict::new(py);
         for (key, value) in settings {
+            out.set_item(key, value)?;
+        }
+        for (key, value) in det_settings {
             out.set_item(key, value)?;
         }
         Ok(out)
@@ -616,7 +689,7 @@ fn default_engine() -> PyResult<&'static Mutex<Engine>> {
     if let Some(e) = DEFAULT_ENGINE.get() {
         return Ok(e);
     }
-    let eng = new_engine("tiny", None, None, None, None, None)?;
+    let eng = new_engine("tiny", None, None, None, None, None, None, None, None, None, None)?;
     Ok(DEFAULT_ENGINE.get_or_init(|| Mutex::new(eng)))
 }
 
