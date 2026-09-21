@@ -633,7 +633,8 @@ impl OcrEngine {
             .collect()
     }
 
-    /// Find text boxes without reading; pairs with `rec` to split stages across engines.
+    /// Find text boxes without reading; needs only the detection model.
+    /// Mix model sizes in one engine with det_model_size/rec_model_size.
     #[pyo3(signature = (image))]
     fn det<'py>(&self, py: Python<'py>, image: &[u8]) -> PyResult<Vec<Bound<'py, PyDict>>> {
         let raw = py

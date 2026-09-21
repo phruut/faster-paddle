@@ -216,7 +216,7 @@ Setting                                            Value
 | `OcrEngine.ocr(image, resize=False, denoise=False, deskew=False, binarize=False) -> dict` | OCR encoded image bytes. |
 | `OcrEngine.ocr_batch(images, *, batch_size=4, resize=False, denoise=False, deskew=False, binarize=False) -> list[dict]` | OCR multiple encoded images; results preserve input order. |
 | `OcrEngine.rec(crops) -> list[{"text": str, "confidence": float}]` | Recognize pre-cropped line images, skipping detection; input order preserved. |
-| `OcrEngine.det(image) -> list[{"topLeftCoord": (x1, y1), "bottomRightCoord": (x2, y2)}]` | Detect text boxes without recognizing; pair with `rec` to split stages. |
+| `OcrEngine.det(image) -> list[{"topLeftCoord": (x1, y1), "bottomRightCoord": (x2, y2)}]` | Detect text boxes without recognizing; needs only the detection model. |
 | `OcrEngine.ocr_base64(image_base64, resize=False, denoise=False, deskew=False, binarize=False) -> dict` | OCR a base64 image string. |
 | `faster_paddle.prepare(image, resize=False, denoise=False, deskew=False, binarize=False) -> bytes` | Preprocess only; returns PNG bytes (no OCR). |
 | `OcrEngine.prepare(image, resize=False, denoise=False, deskew=False, binarize=False) -> bytes` | Preprocess only; returns PNG bytes (no OCR). |
