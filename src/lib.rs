@@ -89,46 +89,37 @@ fn parse_dict(json: &str) -> Vec<String> {
     serde_json::from_str(json).expect("embedded char_dict.json is valid")
 }
 
-/// Resolved model assets for a given size: det bytes, rec bytes, char dict, and
-/// the detection box-score threshold (tiny=0.40, small/medium=0.45).
-struct ModelAssets {
-    det: Cow<'static, [u8]>,
-    rec: Cow<'static, [u8]>,
-    dict: Vec<String>,
-    box_thresh: f32,
-}
-
-fn resolve_model(size: &str) -> PyResult<ModelAssets> {
+/// Per-side model lookups so det and rec sizes can be mixed in one engine.
+fn resolve_det(size: &str) -> PyResult<(Cow<'static, [u8]>, f32)> {
     match size {
-        "tiny" => Ok(ModelAssets {
-            det: Cow::Borrowed(TINY_DET),
-            rec: Cow::Borrowed(TINY_REC),
-            dict: parse_dict(TINY_DICT),
-            box_thresh: 0.40,
-        }),
-        "small" => Ok(ModelAssets {
-            det: Cow::Borrowed(SMALL_DET),
-            rec: Cow::Borrowed(SMALL_REC),
-            dict: parse_dict(BIG_DICT),
-            box_thresh: 0.45,
-        }),
-        "medium" => {
-            let (det, rec) = medium_model_bytes()?;
-            Ok(ModelAssets {
-                det: Cow::Owned(det),
-                rec: Cow::Owned(rec),
-                dict: parse_dict(BIG_DICT),
-                box_thresh: 0.45,
-            })
-        }
+        "tiny" => Ok((Cow::Borrowed(TINY_DET), 0.40)),
+        "small" => Ok((Cow::Borrowed(SMALL_DET), 0.45)),
+        "medium" => Ok((
+            Cow::Owned(medium_model_bytes("det.onnx", "ppocrv6_medium_det.onnx")?),
+            0.45,
+        )),
         other => Err(PyValueError::new_err(format!(
             "unknown model_size {other:?}; expected 'tiny', 'small', or 'medium'"
         ))),
     }
 }
 
-/// Download (once, then cache) and return the medium det + rec ONNX bytes.
-fn medium_model_bytes() -> PyResult<(Vec<u8>, Vec<u8>)> {
+fn resolve_rec(size: &str) -> PyResult<(Cow<'static, [u8]>, Vec<String>)> {
+    match size {
+        "tiny" => Ok((Cow::Borrowed(TINY_REC), parse_dict(TINY_DICT))),
+        "small" => Ok((Cow::Borrowed(SMALL_REC), parse_dict(BIG_DICT))),
+        "medium" => Ok((
+            Cow::Owned(medium_model_bytes("rec.onnx", "ppocrv6_medium_rec.onnx")?),
+            parse_dict(BIG_DICT),
+        )),
+        other => Err(PyValueError::new_err(format!(
+            "unknown model_size {other:?}; expected 'tiny', 'small', or 'medium'"
+        ))),
+    }
+}
+
+/// Download (once, then cache) and return one medium ONNX file.
+fn medium_model_bytes(filename: &str, asset: &str) -> PyResult<Vec<u8>> {
     let cache = dirs::cache_dir()
         .ok_or_else(|| {
             PyRuntimeError::new_err("cannot determine a cache directory for medium models")
@@ -136,9 +127,7 @@ fn medium_model_bytes() -> PyResult<(Vec<u8>, Vec<u8>)> {
         .join("faster_paddle")
         .join(format!("v{VERSION}"))
         .join("medium");
-    let det = fetch_cached(&cache, "det.onnx", "ppocrv6_medium_det.onnx")?;
-    let rec = fetch_cached(&cache, "rec.onnx", "ppocrv6_medium_rec.onnx")?;
-    Ok((det, rec))
+    fetch_cached(&cache, filename, asset)
 }
 
 fn fetch_cached(cache_dir: &std::path::Path, filename: &str, asset: &str) -> PyResult<Vec<u8>> {
@@ -246,6 +235,8 @@ fn env_bool(name: &str) -> Option<bool> {
 #[allow(clippy::too_many_arguments)]
 fn new_engine(
     model_size: &str,
+    det_model_size: Option<&str>,
+    rec_model_size: Option<&str>,
     threads: Option<usize>,
     rec_batch: Option<usize>,
     det_max_side: Option<i64>,
@@ -312,25 +303,30 @@ fn new_engine(
         .or_else(|| env_usize("OCR_THREADS"))
         .unwrap_or_else(hardware::physical_cores)
         .max(1);
+    let det_size = det_model_size.unwrap_or(model_size);
+    let rec_size = rec_model_size.unwrap_or(model_size);
+    let (det_bytes, box_default) = resolve_det(det_size)?;
+    let (rec_bytes, dict) = resolve_rec(rec_size)?;
     let det_t = env_usize("OCR_DET_THREADS").unwrap_or(t.min(8)).clamp(1, t);
     let rb = rec_batch.unwrap_or(ocr::DEFAULT_REC_BATCH);
     let det_max = det_max_side.unwrap_or(ocr::DEFAULT_DET_MAX_SIDE);
     let pool = env_usize("REC_POOL")
-        .unwrap_or(t.min(if model_size == "medium" { 8 } else { 32 }))
+        .unwrap_or(t.min(if rec_size == "medium" { 8 } else { 32 }))
         .clamp(1, t);
-    let m = resolve_model(model_size)?;
     let det_box_thresh = det_box_thresh
         .or_else(|| env_float("OCR_DET_BOX_THRESH").map(|v| v as f32))
-        .unwrap_or(m.box_thresh);
+        .unwrap_or(box_default);
     if !(0.0..=1.0).contains(&det_box_thresh) {
         return Err(PyValueError::new_err(
             "det_box_thresh must be between 0.0 and 1.0",
         ));
     }
     let mut engine = Engine::from_memory(
-        &m.det,
-        &m.rec,
-        m.dict,
+        det_size,
+        rec_size,
+        &det_bytes,
+        &rec_bytes,
+        dict,
         t,
         det_t,
         rb,
@@ -348,7 +344,7 @@ fn new_engine(
     // retains the reference floor until it has equivalent coverage.
     let width = rec_min_width
         .or_else(|| env_usize("OCR_REC_MIN_WIDTH"))
-        .unwrap_or(match model_size {
+        .unwrap_or(match rec_size {
             "tiny" => 64,
             "small" => 96,
             _ => 320,
@@ -525,6 +521,9 @@ impl OcrEngine {
     /// Args:
     ///     model_size: "tiny" (default, bundled), "small" (bundled), or "medium"
     ///         (downloaded once and cached on first use).
+    ///     det_model_size: detection model size; defaults to model_size.
+    ///     rec_model_size: recognition model size; defaults to model_size.
+    ///         Mixing sizes (e.g. tiny det + small rec) loads one of each.
     ///     threads: total CPU budget; defaults to available physical cores,
     ///         respecting affinity and container limits.
     ///     rec_batch: actual recognition batch cap (default 1).
@@ -540,7 +539,7 @@ impl OcrEngine {
     ///     text_score: drop reads below this conf (default 0.0 keep-all).
     ///     det_use_dilation: 2x2 mask dilate before components (default False).
     #[new]
-    #[pyo3(signature = (model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_min_side=None, rec_min_width=None, det_thresh=None, det_box_thresh=None, det_unclip_ratio=None, det_max_candidates=None, text_score=None, det_use_dilation=None))]
+    #[pyo3(signature = (model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_model_size=None, rec_model_size=None, det_min_side=None, rec_min_width=None, det_thresh=None, det_box_thresh=None, det_unclip_ratio=None, det_max_candidates=None, text_score=None, det_use_dilation=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -548,6 +547,8 @@ impl OcrEngine {
         threads: Option<usize>,
         rec_batch: Option<usize>,
         det_max_side: Option<i64>,
+        det_model_size: Option<&str>,
+        rec_model_size: Option<&str>,
         det_min_side: Option<i64>,
         rec_min_width: Option<usize>,
         det_thresh: Option<f32>,
@@ -559,9 +560,13 @@ impl OcrEngine {
     ) -> PyResult<Self> {
         // Model construction and downloads run without holding the GIL.
         let size = model_size.to_string();
+        let det_size = det_model_size.map(str::to_string);
+        let rec_size = rec_model_size.map(str::to_string);
         let engine = py.allow_threads(|| {
             new_engine(
                 &size,
+                det_size.as_deref(),
+                rec_size.as_deref(),
                 threads,
                 rec_batch,
                 det_max_side,
@@ -647,15 +652,18 @@ impl OcrEngine {
     /// Resolved CPU and input-shape settings for diagnostics and reproducibility.
     #[getter]
     fn config<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let (settings, det_settings) = py
+        let (settings, det_settings, models) = py
             .allow_threads(|| {
                 self.inner
                     .lock()
-                    .map(|e| (e.settings(), e.det_settings()))
+                    .map(|e| (e.settings(), e.det_settings(), e.model_names()))
                     .map_err(|e| e.to_string())
             })
             .map_err(PyRuntimeError::new_err)?;
         let out = PyDict::new(py);
+        for (key, value) in models {
+            out.set_item(key, value)?;
+        }
         for (key, value) in settings {
             out.set_item(key, value)?;
         }
@@ -771,7 +779,7 @@ fn default_engine() -> PyResult<&'static Mutex<Engine>> {
         return Ok(e);
     }
     let eng = new_engine(
-        "tiny", None, None, None, None, None, None, None, None, None, None, None,
+        "tiny", None, None, None, None, None, None, None, None, None, None, None, None, None,
     )?;
     Ok(DEFAULT_ENGINE.get_or_init(|| Mutex::new(eng)))
 }

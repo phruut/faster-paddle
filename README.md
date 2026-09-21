@@ -212,7 +212,7 @@ Setting                                            Value
 | `faster_paddle.ocr(image, resize=False, denoise=False, deskew=False, binarize=False) -> dict` | OCR encoded image bytes (shared default engine). |
 | `faster_paddle.ocr_batch(images, *, batch_size=4, resize=False, denoise=False, deskew=False, binarize=False) -> list[dict]` | OCR multiple encoded images; results preserve input order. |
 | `faster_paddle.ocr_base64(image_base64, resize=False, denoise=False, deskew=False, binarize=False) -> dict` | OCR a base64 image string. |
-| `OcrEngine(model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_min_side=None, rec_min_width=None)` | Construct a reusable engine. |
+| `OcrEngine(model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_model_size=None, rec_model_size=None, det_min_side=None, rec_min_width=None)` | Construct a reusable engine. |
 | `OcrEngine.ocr(image, resize=False, denoise=False, deskew=False, binarize=False) -> dict` | OCR encoded image bytes. |
 | `OcrEngine.ocr_batch(images, *, batch_size=4, resize=False, denoise=False, deskew=False, binarize=False) -> list[dict]` | OCR multiple encoded images; results preserve input order. |
 | `OcrEngine.rec(crops) -> list[{"text": str, "confidence": float}]` | Recognize pre-cropped line images, skipping detection; input order preserved. |
@@ -223,6 +223,9 @@ Setting                                            Value
 
 - `resize`/`denoise`/`deskew`/`binarize`: optional preprocessing (see above).
 - `model_size`: `"tiny"` (default), `"small"`, or `"medium"`.
+- `det_model_size`/`rec_model_size`: per-stage model size, defaulting to
+  `model_size`. Mixing sizes (e.g. `OcrEngine("tiny", rec_model_size="small")`)
+  loads a fast detector with a more accurate recognizer in one engine.
 - `threads`: total CPU budget; defaults to available physical cores, limited by
   affinity and OS/container quotas. An explicit positive value overrides discovery.
 - `batch_size`: maximum decoded images per batch window (default **4**, must be positive).

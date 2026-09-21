@@ -47,6 +47,8 @@ struct RecWorker {
 }
 
 pub struct Engine {
+    det_model: String,
+    rec_model: String,
     det: Session,
     /// Pool of recognition sessions, run concurrently across batches so the many
     /// small rec matmuls keep all cores busy (a single session under-utilizes them).
@@ -89,6 +91,8 @@ impl Engine {
     /// the library, so no files are needed at runtime).
     #[allow(clippy::too_many_arguments)]
     pub fn from_memory(
+        det_model: &str,
+        rec_model: &str,
         det_bytes: &[u8],
         rec_bytes: &[u8],
         char_dict: Vec<String>,
@@ -202,6 +206,8 @@ impl Engine {
         chars.extend(char_dict);
         chars.push(" ".to_string());
         Ok(Engine {
+            det_model: det_model.to_string(),
+            rec_model: rec_model.to_string(),
             det,
             rec,
             wide_rec,
@@ -267,6 +273,13 @@ impl Engine {
             ("det_max_side", self.det_max_side as usize),
             ("det_max_candidates", self.det_max_candidates),
             ("det_use_dilation", usize::from(self.det_use_dilation)),
+        ]
+    }
+
+    pub fn model_names(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("det_model_size", self.det_model.clone()),
+            ("rec_model_size", self.rec_model.clone()),
         ]
     }
 

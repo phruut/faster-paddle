@@ -408,6 +408,43 @@ def test_det_only_matches_ocr_boxes():
         eng.det(b"invalid")
 
 
+def test_mixed_model_sizes():
+    import pytest
+    data = _small()
+    # mixed engine: tiny det + small rec
+    mixed = faster_paddle.OcrEngine(
+        model_size="tiny", det_model_size="tiny", rec_model_size="small", threads=2,
+    )
+    cfg = mixed.config
+    assert cfg["det_model_size"] == "tiny"
+    assert cfg["rec_model_size"] == "small"
+    # det must match a pure tiny engine, rec must match a pure small engine
+    tiny = faster_paddle.OcrEngine(model_size="tiny", threads=2)
+    assert mixed.det(data) == tiny.det(data)
+    small = faster_paddle.OcrEngine(model_size="small", threads=2)
+    full = mixed.ocr(data)
+    assert len(full["bounds"]) > 50
+    crops_ok = list(full["bounds"].values())[:2]
+    src = Image.open(io.BytesIO(data)).convert("RGB")
+    crops = []
+    for b in crops_ok:
+        x1, y1 = b["topLeftCoord"]
+        x2, y2 = b["bottomRightCoord"]
+        crop = src.crop((max(0, x1), max(0, y1), max(x1 + 1, x2), max(y1 + 1, y2)))
+        buf = io.BytesIO()
+        crop.save(buf, format="PNG")
+        crops.append(buf.getvalue())
+    assert mixed.rec(crops) == small.rec(crops)
+    # defaults keep the plain model_size behavior
+    plain = faster_paddle.OcrEngine(model_size="small", threads=2)
+    assert plain.config["det_model_size"] == "small"
+    assert plain.config["rec_model_size"] == "small"
+    with pytest.raises(ValueError):
+        faster_paddle.OcrEngine(det_model_size="huge")
+    with pytest.raises(ValueError):
+        faster_paddle.OcrEngine(rec_model_size="huge")
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
