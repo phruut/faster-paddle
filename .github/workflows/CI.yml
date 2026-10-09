@@ -29,7 +29,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release --locked
       - run: python -m pip install maturin pytest pillow
-      - run: maturin build --release --locked --out dist-test
+      # Self-contained test wheel: bundles every size so the suite stays
+      # offline and never depends on release assets. The platform jobs below
+      # cover the code-only + model_dir path; `download-check` covers downloads.
+      - run: maturin build --release --locked --features bundled-all --out dist-test
       - run: python -m pip install dist-test/*.whl
       - run: python -m pytest tests -q
 
@@ -66,11 +69,15 @@ jobs:
           # host's libstdc++.so.6 version (manylinux GCC 11 references
           # GLIBCXX_3.4.29 symbols missing on older systems).
           before-script-linux: export ORT_CXX_STDLIB=
+      # The wheels built above are code-only (no bundled weights); point the
+      # suite at the checkout's models/ so wheel tests stay offline and never
+      # depend on release assets.
       - name: Test installed wheel and linked runtime
         shell: bash
         env:
           OCR_THREADS: "2"
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          FASTER_PADDLE_MODEL_DIR: ${{ github.workspace }}/models
         run: |
           python -m pip install pytest pillow dist/*.whl
           if ! python -m pytest tests -q > wheel-tests.log 2>&1; then
@@ -101,11 +108,15 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --locked --out dist
           sccache: "true"
+      # The wheels built above are code-only (no bundled weights); point the
+      # suite at the checkout's models/ so wheel tests stay offline and never
+      # depend on release assets.
       - name: Test installed wheel and linked runtime
         shell: bash
         env:
           OCR_THREADS: "2"
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          FASTER_PADDLE_MODEL_DIR: ${{ github.workspace }}/models
         run: |
           python -m pip install pytest pillow dist/*.whl
           if ! python -m pytest tests -q > wheel-tests.log 2>&1; then
@@ -137,11 +148,15 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --locked --out dist
           sccache: "true"
+      # The wheels built above are code-only (no bundled weights); point the
+      # suite at the checkout's models/ so wheel tests stay offline and never
+      # depend on release assets.
       - name: Test installed wheel and linked runtime
         shell: bash
         env:
           OCR_THREADS: "2"
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          FASTER_PADDLE_MODEL_DIR: ${{ github.workspace }}/models
         run: |
           python -m pip install pytest pillow dist/*.whl
           if ! python -m pytest tests -q > wheel-tests.log 2>&1; then
@@ -197,3 +212,33 @@ jobs:
             ppocrv6_small_rec.onnx
             ppocrv6_medium_det.onnx
             ppocrv6_medium_rec.onnx
+
+  # Tag-only: proves the uploaded assets are fetchable under the exact names
+  # the runtime downloads (guards against misnamed/missing assets). Runs after
+  # both the wheel build and the asset upload, with no local weights present.
+  download-check:
+    name: Check on-demand model download
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, model-assets]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-linux-x86_64
+          path: dist
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install dist/*.whl
+      - name: Construct an engine with no local weights (forces download)
+        shell: bash
+        env:
+          OCR_THREADS: "2"
+        run: |
+          python -c "
+          from faster_paddle import OcrEngine
+          eng = OcrEngine(model_size='tiny', threads=2)
+          cfg = eng.config
+          assert (cfg['det_source'], cfg['rec_source']) == ('downloaded', 'downloaded'), cfg
+          print('download OK:', cfg['det_model_size'], cfg['det_source'], cfg['rec_source'])
+          "
