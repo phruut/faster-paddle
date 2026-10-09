@@ -96,6 +96,8 @@ const MEDIUM_DET: &[u8] = include_bytes!("../models/medium/det.onnx");
 const MEDIUM_REC: &[u8] = include_bytes!("../models/medium/rec.onnx");
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+// Release hosting the downloadable weights (see the `model-assets` CI job).
+const RELEASE_BASE: &str = "https://github.com/phruut/faster-paddle/releases/download";
 
 fn parse_dict(json: &str) -> Vec<String> {
     serde_json::from_str(json).expect("embedded char_dict.json is valid")
@@ -260,8 +262,7 @@ fn fetch_cached(
     }
     std::fs::create_dir_all(cache_dir)
         .map_err(|e| PyRuntimeError::new_err(format!("cannot create cache dir: {e}")))?;
-    let url =
-        format!("https://github.com/cnmoro/faster-paddle/releases/download/v{VERSION}/{asset}");
+    let url = format!("{RELEASE_BASE}/v{VERSION}/{asset}");
     let resp = ureq::get(&url).call().map_err(|e| {
         PyRuntimeError::new_err(format!(
             "failed to download {size} model from {url}: {e}; \

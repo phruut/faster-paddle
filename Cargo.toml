@@ -1,10 +1,10 @@
 [package]
 name = "faster_paddle"
-version = "1.0.4"
+version = "1.1.0"
 edition = "2021"
 license = "MIT"
 description = "Fast CPU OCR (PaddleOCR PP-OCRv6 tiny/small/medium) with Python bindings, powered by ONNX Runtime."
-repository = "https://github.com/cnmoro/faster-paddle"
+repository = "https://github.com/phruut/faster-paddle"
 # Models are optional at build time. The default wheel bundles nothing
 # (code-only); sizes load from `model_dir`, the local cache, or a one-time
 # download from the GitHub release. Build with `--features bundled-tiny`,
