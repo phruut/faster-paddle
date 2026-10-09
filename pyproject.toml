@@ -30,5 +30,6 @@ Repository = "https://github.com/cnmoro/faster-paddle"
 module-name = "faster_paddle"
 features = ["pyo3/extension-module"]
 strip = true
-# Model bytes are embedded in the extension. Cargo.toml includes the source
-# assets in sdists; duplicating them as wheel data would inflate downloads.
+# Bundled model bytes (if any, via `--features bundled-*`) live in the
+# extension. Cargo.toml includes the source assets in sdists; duplicating
+# them as wheel data would inflate downloads.

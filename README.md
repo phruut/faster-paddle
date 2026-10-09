@@ -8,10 +8,12 @@ powered by [ONNX Runtime](https://onnxruntime.ai/).
   dynamic recognition scheduling, and model-specific input widths.
 - 🗂️ **Multi-image OCR** with `ocr_batch`: ordered results and shared recognition
   work across pages. [See batch usage](#multiple-images).
-- 📦 **Self-contained** — the tiny + small ONNX models are bundled inside the
-  wheel. No `paddlepaddle`, no model downloads for tiny/small.
+- 📦 **Code-only default** — the wheel bundles no model weights. Each size is
+  loaded from `model_dir`, the local cache, or a one-time download from the
+  GitHub release. Build with `--features bundled-tiny/small/medium/all` for a
+  self-contained wheel with the weights embedded.
 - 🎚️ **Three model sizes**: `tiny` (default, fastest), `small`, and `medium`
-  (higher accuracy; downloaded once on first use and cached).
+  (higher accuracy).
 - 🦀 Pure-Rust pre/post-processing (detection DB decode, `minAreaRect`,
   perspective crop, CTC decode, reading-order text reconstruction). No OpenCV.
 - 🖥️ Prebuilt wheels for **Linux, Windows, macOS** (x86-64 + arm64).
@@ -143,15 +145,35 @@ result = engine.ocr(prepared)
 
 ### Model sizes
 
-| size     | bundled | det+rec | notes |
-|----------|---------|---------|-------|
-| `tiny`   | ✅ yes  | ~6 MB   | default, fastest, lightweight |
-| `small`  | ✅ yes  | ~31 MB  | better accuracy |
-| `medium` | ⬇️ on demand | ~138 MB | best accuracy; downloaded once from the GitHub release and cached under your user cache dir |
+| size     | default wheel | det+rec | notes |
+|----------|---------------|---------|-------|
+| `tiny`   | ⬇️ on demand  | ~6 MB   | default, fastest, lightweight |
+| `small`  | ⬇️ on demand  | ~31 MB  | better accuracy |
+| `medium` | ⬇️ on demand  | ~138 MB | best accuracy |
 
-`tiny` and `small` are embedded in the wheel (offline). `medium` exceeds PyPI's
-file-size limit, so the first `OcrEngine(model_size="medium")` downloads it once
-(needs network that time only) and caches it for subsequent runs.
+A size that isn't bundled in your build is downloaded once on first use (needs
+network that time only) and cached under your user cache dir
+(`.../faster_paddle/v<VERSION>/{tiny,small,medium}/`). Point the engine at
+local weights to stay fully offline:
+
+```python
+engine = OcrEngine(model_size="tiny", model_dir="/path/to/models")
+# or:  FASTER_PADDLE_MODEL_DIR=/path/to/models
+```
+
+Layout mirrors this repo: `{model_dir}/{tiny,small,medium}/{det.onnx,rec.onnx}`,
+plus an optional `char_dict.json` per size for custom recognizers. Local files
+beat bundled, cached, and downloaded weights. `engine.config` reports
+`det_source` / `rec_source` (`local`, `bundled`, `cached`, `downloaded`) and the
+resolved `model_dir`.
+
+To embed weights instead of downloading, build from source with cargo features:
+
+```bash
+maturin build --release --features bundled-tiny    # tiny-only (~6 MB of models)
+maturin build --release --features bundled-small   # small-only (~31 MB)
+maturin build --release --features bundled-all     # tiny + small + medium embedded
+```
 
 ### Result shape
 
@@ -212,7 +234,7 @@ Setting                                            Value
 | `faster_paddle.ocr(image, resize=False, denoise=False, deskew=False, binarize=False) -> dict` | OCR encoded image bytes (shared default engine). |
 | `faster_paddle.ocr_batch(images, *, batch_size=4, resize=False, denoise=False, deskew=False, binarize=False) -> list[dict]` | OCR multiple encoded images; results preserve input order. |
 | `faster_paddle.ocr_base64(image_base64, resize=False, denoise=False, deskew=False, binarize=False) -> dict` | OCR a base64 image string. |
-| `OcrEngine(model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_model_size=None, rec_model_size=None, det_min_side=None, rec_min_width=None)` | Construct a reusable engine. |
+| `OcrEngine(model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_model_size=None, rec_model_size=None, model_dir=None, det_min_side=None, rec_min_width=None)` | Construct a reusable engine. |
 | `OcrEngine.ocr(image, resize=False, denoise=False, deskew=False, binarize=False) -> dict` | OCR encoded image bytes. |
 | `OcrEngine.ocr_batch(images, *, batch_size=4, resize=False, denoise=False, deskew=False, binarize=False) -> list[dict]` | OCR multiple encoded images; results preserve input order. |
 | `OcrEngine.rec(crops) -> list[{"text": str, "confidence": float}]` | Recognize pre-cropped line images, skipping detection; input order preserved. |
@@ -226,6 +248,9 @@ Setting                                            Value
 - `det_model_size`/`rec_model_size`: per-stage model size, defaulting to
   `model_size`. Mixing sizes (e.g. `OcrEngine("tiny", rec_model_size="small")`)
   loads a fast detector with a more accurate recognizer in one engine.
+- `model_dir`: directory with local weights (see Model sizes), defaulting to
+  `FASTER_PADDLE_MODEL_DIR`. Each needed size falls back to bundled weights
+  (if built in), then cache, then a one-time download.
 - `threads`: total CPU budget; defaults to available physical cores, limited by
   affinity and OS/container quotas. An explicit positive value overrides discovery.
 - `batch_size`: maximum decoded images per batch window (default **4**, must be positive).
@@ -300,6 +325,10 @@ maturin develop --release      # build + install into the current environment
 # or
 maturin build --release        # produce a wheel in target/wheels/
 ```
+
+Add `--features bundled-tiny`, `bundled-small`, `bundled-medium`, or
+`bundled-all` to embed weights (default wheel bundles nothing; see Model
+sizes).
 
 Requires a Rust toolchain. ONNX Runtime is fetched automatically by the `ort`
 crate at build time and linked into the extension.

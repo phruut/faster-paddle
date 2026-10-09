@@ -15,6 +15,7 @@ from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURE = os.path.join(HERE, "fixtures", "document.png")  # two-pane UI screenshot
+MODELS_DIR = os.path.abspath(os.path.join(HERE, "..", "models"))
 
 
 def _small():
@@ -443,6 +444,46 @@ def test_mixed_model_sizes():
         faster_paddle.OcrEngine(det_model_size="huge")
     with pytest.raises(ValueError):
         faster_paddle.OcrEngine(rec_model_size="huge")
+    with pytest.raises(ValueError):
+        faster_paddle.OcrEngine(model_size="huge")
+
+
+def test_model_dir_loads_local_models_offline():
+    # a code-only build stays fully offline when pointed at local weights
+    eng = faster_paddle.OcrEngine(model_size="tiny", threads=2, model_dir=MODELS_DIR)
+    cfg = eng.config
+    assert cfg["det_source"] == "local"
+    assert cfg["rec_source"] == "local"
+    assert cfg["model_dir"] == MODELS_DIR
+    data = _small()
+    expected = _signature(eng.ocr(data))
+    assert len(expected) > 50
+    # deterministic across constructions from the same directory
+    again = faster_paddle.OcrEngine(model_size="tiny", threads=2, model_dir=MODELS_DIR)
+    assert _signature(again.ocr(data)) == expected
+    # per-side sizes resolve independently from the same directory
+    mixed = faster_paddle.OcrEngine(
+        model_size="tiny", det_model_size="tiny", rec_model_size="tiny",
+        threads=2, model_dir=MODELS_DIR,
+    )
+    assert _signature(mixed.ocr(data)) == expected
+
+
+def test_model_dir_env_var_and_arg_precedence():
+    from unittest.mock import patch
+
+    import pytest
+    data = _small()
+    with patch.dict(os.environ, {"FASTER_PADDLE_MODEL_DIR": MODELS_DIR}):
+        eng = faster_paddle.OcrEngine(model_size="tiny", threads=2)
+        assert eng.config["det_source"] == "local"
+        assert eng.config["model_dir"] == MODELS_DIR
+        expected = _signature(eng.ocr(data))
+        # explicit arg beats the env var (bogus size still fails, not silently ignored)
+        with pytest.raises(ValueError):
+            faster_paddle.OcrEngine(model_size="huge", threads=2)
+    assert "FASTER_PADDLE_MODEL_DIR" not in os.environ
+    assert expected
 
 
 if __name__ == "__main__":

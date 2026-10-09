@@ -87,8 +87,9 @@ pub struct ImageRgb {
 }
 
 impl Engine {
-    /// Build an engine from in-memory ONNX model bytes (models are embedded in
-    /// the library, so no files are needed at runtime).
+    /// Build an engine from in-memory ONNX model bytes (bundled weights, local
+    /// `model_dir` files, cache hits, or one-time downloads — resolved by the
+    /// caller, so no files are needed here at runtime).
     #[allow(clippy::too_many_arguments)]
     pub fn from_memory(
         det_model: &str,

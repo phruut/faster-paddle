@@ -7,10 +7,8 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Serialize runs that share a ref so a tag push can't spawn two runs that race
-# each other's PyPI upload (that race produced a spurious "Publish to PyPI"
-# failure on v1.0.0). cancel-in-progress:false lets an in-flight publish finish;
-# a queued duplicate then re-runs and cleanly --skip-existing's the same files.
+# Serialize runs that share a ref so duplicate tag pushes don't race the
+# model-asset upload.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: false
@@ -171,10 +169,11 @@ jobs:
           name: wheels-sdist
           path: dist
 
-  # The medium models are too large for PyPI, so they ship as GitHub Release
-  # assets and the library downloads them on demand (see fetch_cached in lib.rs).
-  medium-models:
-    name: Upload medium models to release
+  # The default wheel bundles no model weights; every size ships as a GitHub
+  # Release asset and the library downloads it on demand on first use
+  # (see model_bytes in src/lib.rs). Asset names must match the runtime URL.
+  model-assets:
+    name: Upload model weights to release
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -183,31 +182,18 @@ jobs:
       - uses: actions/checkout@v4
       - name: Stage assets (names must match the runtime download URL)
         run: |
+          cp models/tiny/det.onnx ppocrv6_tiny_det.onnx
+          cp models/tiny/rec.onnx ppocrv6_tiny_rec.onnx
+          cp models/small/det.onnx ppocrv6_small_det.onnx
+          cp models/small/rec.onnx ppocrv6_small_rec.onnx
           cp models/medium/det.onnx ppocrv6_medium_det.onnx
           cp models/medium/rec.onnx ppocrv6_medium_rec.onnx
       - uses: softprops/action-gh-release@v2
         with:
           files: |
+            ppocrv6_tiny_det.onnx
+            ppocrv6_tiny_rec.onnx
+            ppocrv6_small_det.onnx
+            ppocrv6_small_rec.onnx
             ppocrv6_medium_det.onnx
             ppocrv6_medium_rec.onnx
-
-  release:
-    name: Publish to PyPI
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [tests, linux, windows, macos, sdist]
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Publish to PyPI
-        uses: PyO3/maturin-action@v1
-        env:
-          # Configure this secret in repo settings → Secrets → Actions.
-          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-        with:
-          command: upload
-          args: --non-interactive --skip-existing dist/*

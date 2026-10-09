@@ -1,9 +1,11 @@
-//! Python bindings for FasterPaddle — a fast, CPU-only OCR engine specialized
-//! for PaddleOCR's lightweight PP-OCRv6 *tiny* detection + recognition models.
+//! Python bindings for FasterPaddle — a fast, CPU-only OCR engine for
+//! PaddleOCR's PP-OCRv6 detection + recognition models.
 //!
-//! The ONNX models and character dictionary are embedded in the compiled
-//! extension, so the wheel is fully self-contained — no model files or network
-//! access are needed at runtime.
+//! Model weights are optional at build time (cargo features `bundled-tiny`,
+//! `bundled-small`, `bundled-medium`; default wheel bundles nothing). Sizes
+//! that aren't embedded load from `model_dir`, the local cache, or a one-time
+//! download from the GitHub release. The character dictionaries are kilobytes
+//! and always embedded.
 
 mod cv;
 mod hardware;
@@ -72,16 +74,26 @@ use pyo3::types::{PyBytes, PyDict, PyTuple};
 use std::borrow::Cow;
 use std::sync::{Mutex, OnceLock};
 
-// ---- embedded models (tiny + small) ----
-// The medium models (~138 MB) exceed PyPI's size limit, so they are downloaded
-// on demand and cached locally (see `medium_model_bytes`).
+// ---- model weights (optional at build time) ----
+// The default wheel bundles nothing. Each size resolves as: local `model_dir`
+// file > embedded bytes (built with the matching `bundled-<size>` feature) >
+// cache hit > one-time GitHub release download (see `model_bytes`).
+// Dictionaries are kilobytes, so they stay always embedded.
+#[cfg(feature = "bundled-tiny")]
 const TINY_DET: &[u8] = include_bytes!("../models/tiny/det.onnx");
+#[cfg(feature = "bundled-tiny")]
 const TINY_REC: &[u8] = include_bytes!("../models/tiny/rec.onnx");
 const TINY_DICT: &str = include_str!("../models/tiny/char_dict.json");
+#[cfg(feature = "bundled-small")]
 const SMALL_DET: &[u8] = include_bytes!("../models/small/det.onnx");
+#[cfg(feature = "bundled-small")]
 const SMALL_REC: &[u8] = include_bytes!("../models/small/rec.onnx");
 // small and medium share the same (larger) character dictionary
 const BIG_DICT: &str = include_str!("../models/small/char_dict.json");
+#[cfg(feature = "bundled-medium")]
+const MEDIUM_DET: &[u8] = include_bytes!("../models/medium/det.onnx");
+#[cfg(feature = "bundled-medium")]
+const MEDIUM_REC: &[u8] = include_bytes!("../models/medium/rec.onnx");
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -89,48 +101,157 @@ fn parse_dict(json: &str) -> Vec<String> {
     serde_json::from_str(json).expect("embedded char_dict.json is valid")
 }
 
+fn parse_dict_owned(json: &str, size: &str) -> PyResult<Vec<String>> {
+    serde_json::from_str(json).map_err(|e| {
+        PyValueError::new_err(format!("invalid char_dict.json for {size:?} in model_dir: {e}"))
+    })
+}
+
+fn check_size(size: &str) -> PyResult<()> {
+    match size {
+        "tiny" | "small" | "medium" => Ok(()),
+        other => Err(PyValueError::new_err(format!(
+            "unknown model_size {other:?}; expected 'tiny', 'small', or 'medium'"
+        ))),
+    }
+}
+
+/// Embedded det weights, if this build bundles `size`.
+fn bundled_det(size: &str) -> Option<&'static [u8]> {
+    match size {
+        #[cfg(feature = "bundled-tiny")]
+        "tiny" => Some(TINY_DET),
+        #[cfg(feature = "bundled-small")]
+        "small" => Some(SMALL_DET),
+        #[cfg(feature = "bundled-medium")]
+        "medium" => Some(MEDIUM_DET),
+        _ => None,
+    }
+}
+
+/// Embedded rec weights, if this build bundles `size`.
+fn bundled_rec(size: &str) -> Option<&'static [u8]> {
+    match size {
+        #[cfg(feature = "bundled-tiny")]
+        "tiny" => Some(TINY_REC),
+        #[cfg(feature = "bundled-small")]
+        "small" => Some(SMALL_REC),
+        #[cfg(feature = "bundled-medium")]
+        "medium" => Some(MEDIUM_REC),
+        _ => None,
+    }
+}
+
+/// Explicit model directory: constructor arg wins, else FASTER_PADDLE_MODEL_DIR.
+fn resolve_model_dir(explicit: Option<&str>) -> Option<std::path::PathBuf> {
+    let raw = explicit
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var("FASTER_PADDLE_MODEL_DIR").ok())
+        .filter(|s| !s.is_empty())?;
+    Some(std::path::PathBuf::from(raw))
+}
+
+/// Local `{model_dir}/{size}/{filename}` override, when present and plausible.
+fn local_model_bytes(
+    dir: Option<&std::path::Path>,
+    size: &str,
+    filename: &str,
+) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(dir?.join(size).join(filename)).ok()?;
+    (bytes.len() > 1024).then_some(bytes)
+}
+
+/// Optional `{model_dir}/{size}/char_dict.json` for custom recognizers.
+fn local_dict(dir: Option<&std::path::Path>, size: &str) -> Option<String> {
+    std::fs::read_to_string(dir?.join(size).join("char_dict.json"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Release asset names must match the files attached to the GitHub release
+/// (see the `model-assets` CI job).
+fn det_asset(size: &str) -> &'static str {
+    match size {
+        "tiny" => "ppocrv6_tiny_det.onnx",
+        "small" => "ppocrv6_small_det.onnx",
+        _ => "ppocrv6_medium_det.onnx",
+    }
+}
+
+fn rec_asset(size: &str) -> &'static str {
+    match size {
+        "tiny" => "ppocrv6_tiny_rec.onnx",
+        "small" => "ppocrv6_small_rec.onnx",
+        _ => "ppocrv6_medium_rec.onnx",
+    }
+}
+
 /// Per-side model lookups so det and rec sizes can be mixed in one engine.
-fn resolve_det(size: &str) -> PyResult<(Cow<'static, [u8]>, f32)> {
-    match size {
-        "tiny" => Ok((Cow::Borrowed(TINY_DET), 0.40)),
-        "small" => Ok((Cow::Borrowed(SMALL_DET), 0.45)),
-        "medium" => Ok((
-            Cow::Owned(medium_model_bytes("det.onnx", "ppocrv6_medium_det.onnx")?),
-            0.45,
-        )),
-        other => Err(PyValueError::new_err(format!(
-            "unknown model_size {other:?}; expected 'tiny', 'small', or 'medium'"
-        ))),
+/// Also returns where the weights came from (`local`, `bundled`, `cached`,
+/// `downloaded`) for `config` diagnostics.
+fn resolve_det(
+    size: &str,
+    model_dir: Option<&std::path::Path>,
+) -> PyResult<(Cow<'static, [u8]>, f32, &'static str)> {
+    check_size(size)?;
+    let thresh = if size == "tiny" { 0.40 } else { 0.45 };
+    if let Some(bytes) = local_model_bytes(model_dir, size, "det.onnx") {
+        return Ok((Cow::Owned(bytes), thresh, "local"));
     }
+    if let Some(bytes) = bundled_det(size) {
+        return Ok((Cow::Borrowed(bytes), thresh, "bundled"));
+    }
+    let (bytes, source) = model_bytes(size, "det.onnx", det_asset(size))?;
+    Ok((Cow::Owned(bytes), thresh, source))
 }
 
-fn resolve_rec(size: &str) -> PyResult<(Cow<'static, [u8]>, Vec<String>)> {
-    match size {
-        "tiny" => Ok((Cow::Borrowed(TINY_REC), parse_dict(TINY_DICT))),
-        "small" => Ok((Cow::Borrowed(SMALL_REC), parse_dict(BIG_DICT))),
-        "medium" => Ok((
-            Cow::Owned(medium_model_bytes("rec.onnx", "ppocrv6_medium_rec.onnx")?),
-            parse_dict(BIG_DICT),
-        )),
-        other => Err(PyValueError::new_err(format!(
-            "unknown model_size {other:?}; expected 'tiny', 'small', or 'medium'"
-        ))),
+fn resolve_rec(
+    size: &str,
+    model_dir: Option<&std::path::Path>,
+) -> PyResult<(Cow<'static, [u8]>, Vec<String>, &'static str)> {
+    check_size(size)?;
+    let dict = match local_dict(model_dir, size) {
+        Some(json) => parse_dict_owned(&json, size)?,
+        None => parse_dict(if size == "tiny" { TINY_DICT } else { BIG_DICT }),
+    };
+    if let Some(bytes) = local_model_bytes(model_dir, size, "rec.onnx") {
+        return Ok((Cow::Owned(bytes), dict, "local"));
     }
+    if let Some(bytes) = bundled_rec(size) {
+        return Ok((Cow::Borrowed(bytes), dict, "bundled"));
+    }
+    let (bytes, source) = model_bytes(size, "rec.onnx", rec_asset(size))?;
+    Ok((Cow::Owned(bytes), dict, source))
 }
 
-/// Download (once, then cache) and return one medium ONNX file.
-fn medium_model_bytes(filename: &str, asset: &str) -> PyResult<Vec<u8>> {
+/// Cache hit or one-time download of a non-bundled ONNX file. Returns the
+/// bytes and whether they were `cached` or `downloaded`.
+fn model_bytes(size: &str, filename: &str, asset: &str) -> PyResult<(Vec<u8>, &'static str)> {
     let cache = dirs::cache_dir()
         .ok_or_else(|| {
-            PyRuntimeError::new_err("cannot determine a cache directory for medium models")
+            PyRuntimeError::new_err(format!(
+                "cannot determine a cache directory for {size} models"
+            ))
         })?
         .join("faster_paddle")
         .join(format!("v{VERSION}"))
-        .join("medium");
-    fetch_cached(&cache, filename, asset)
+        .join(size);
+    let path = cache.join(filename);
+    if let Ok(bytes) = std::fs::read(&path) {
+        if bytes.len() > 1024 {
+            return Ok((bytes, "cached"));
+        }
+    }
+    Ok((fetch_cached(&cache, filename, asset, size)?, "downloaded"))
 }
 
-fn fetch_cached(cache_dir: &std::path::Path, filename: &str, asset: &str) -> PyResult<Vec<u8>> {
+fn fetch_cached(
+    cache_dir: &std::path::Path,
+    filename: &str,
+    asset: &str,
+    size: &str,
+) -> PyResult<Vec<u8>> {
     let path = cache_dir.join(filename);
     if let Ok(bytes) = std::fs::read(&path) {
         if bytes.len() > 1024 {
@@ -142,14 +263,18 @@ fn fetch_cached(cache_dir: &std::path::Path, filename: &str, asset: &str) -> PyR
     let url =
         format!("https://github.com/cnmoro/faster-paddle/releases/download/v{VERSION}/{asset}");
     let resp = ureq::get(&url).call().map_err(|e| {
-        PyRuntimeError::new_err(format!("failed to download medium model from {url}: {e}"))
+        PyRuntimeError::new_err(format!(
+            "failed to download {size} model from {url}: {e}; \
+             pass model_dir with local weights or rebuild with \
+             `--features bundled-{size}` for offline use"
+        ))
     })?;
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut resp.into_reader(), &mut bytes)
-        .map_err(|e| PyRuntimeError::new_err(format!("failed reading medium model: {e}")))?;
+        .map_err(|e| PyRuntimeError::new_err(format!("failed reading {size} model: {e}")))?;
     if bytes.len() <= 1024 {
         return Err(PyRuntimeError::new_err(format!(
-            "downloaded medium model from {url} looks invalid ({} bytes)",
+            "downloaded {size} model from {url} looks invalid ({} bytes)",
             bytes.len()
         )));
     }
@@ -237,6 +362,7 @@ fn new_engine(
     model_size: &str,
     det_model_size: Option<&str>,
     rec_model_size: Option<&str>,
+    model_dir: Option<&str>,
     threads: Option<usize>,
     rec_batch: Option<usize>,
     det_max_side: Option<i64>,
@@ -248,7 +374,7 @@ fn new_engine(
     det_max_candidates: Option<usize>,
     text_score: Option<f32>,
     det_use_dilation: Option<bool>,
-) -> PyResult<Engine> {
+) -> PyResult<(Engine, &'static str, &'static str, Option<String>)> {
     if threads == Some(0) || rec_batch == Some(0) {
         return Err(PyValueError::new_err(
             "threads and rec_batch must be positive",
@@ -305,8 +431,9 @@ fn new_engine(
         .max(1);
     let det_size = det_model_size.unwrap_or(model_size);
     let rec_size = rec_model_size.unwrap_or(model_size);
-    let (det_bytes, box_default) = resolve_det(det_size)?;
-    let (rec_bytes, dict) = resolve_rec(rec_size)?;
+    let dir = resolve_model_dir(model_dir);
+    let (det_bytes, box_default, det_source) = resolve_det(det_size, dir.as_deref())?;
+    let (rec_bytes, dict, rec_source) = resolve_rec(rec_size, dir.as_deref())?;
     let det_t = env_usize("OCR_DET_THREADS").unwrap_or(t.min(8)).clamp(1, t);
     let rb = rec_batch.unwrap_or(ocr::DEFAULT_REC_BATCH);
     let det_max = det_max_side.unwrap_or(ocr::DEFAULT_DET_MAX_SIDE);
@@ -351,7 +478,8 @@ fn new_engine(
         })
         .clamp(64, 3200);
     engine.set_input_limits(det_min_side, Some(width));
-    Ok(engine)
+    let dir_str = dir.map(|p| p.to_string_lossy().into_owned());
+    Ok((engine, det_source, rec_source, dir_str))
 }
 
 /// Plain-Rust OCR output (GIL-free), assembled into a Python dict afterwards.
@@ -512,6 +640,9 @@ fn build_dict<'py>(py: Python<'py>, raw: RawResult) -> PyResult<Bound<'py, PyDic
 #[pyclass]
 struct OcrEngine {
     inner: Mutex<Engine>,
+    det_source: &'static str,
+    rec_source: &'static str,
+    model_dir: Option<String>,
 }
 
 #[pymethods]
@@ -519,11 +650,16 @@ impl OcrEngine {
     /// Create an engine.
     ///
     /// Args:
-    ///     model_size: "tiny" (default, bundled), "small" (bundled), or "medium"
-    ///         (downloaded once and cached on first use).
+    ///     model_size: "tiny" (default), "small", or "medium". Sizes not
+    ///         bundled in this build are downloaded once and cached on first use.
     ///     det_model_size: detection model size; defaults to model_size.
     ///     rec_model_size: recognition model size; defaults to model_size.
     ///         Mixing sizes (e.g. tiny det + small rec) loads one of each.
+    ///     model_dir: optional directory with local weights
+    ///         (`{model_dir}/{tiny,small,medium}/{det.onnx,rec.onnx}`, plus an
+    ///         optional `char_dict.json` per size). Falls back to
+    ///         `FASTER_PADDLE_MODEL_DIR`. Local files beat bundled, cached, and
+    ///         downloaded weights, so a code-only build stays fully offline.
     ///     threads: total CPU budget; defaults to available physical cores,
     ///         respecting affinity and container limits.
     ///     rec_batch: actual recognition batch cap (default 1).
@@ -539,7 +675,7 @@ impl OcrEngine {
     ///     text_score: drop reads below this conf (default 0.0 keep-all).
     ///     det_use_dilation: 2x2 mask dilate before components (default False).
     #[new]
-    #[pyo3(signature = (model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_model_size=None, rec_model_size=None, det_min_side=None, rec_min_width=None, det_thresh=None, det_box_thresh=None, det_unclip_ratio=None, det_max_candidates=None, text_score=None, det_use_dilation=None))]
+    #[pyo3(signature = (model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_model_size=None, rec_model_size=None, model_dir=None, det_min_side=None, rec_min_width=None, det_thresh=None, det_box_thresh=None, det_unclip_ratio=None, det_max_candidates=None, text_score=None, det_use_dilation=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -549,6 +685,7 @@ impl OcrEngine {
         det_max_side: Option<i64>,
         det_model_size: Option<&str>,
         rec_model_size: Option<&str>,
+        model_dir: Option<&str>,
         det_min_side: Option<i64>,
         rec_min_width: Option<usize>,
         det_thresh: Option<f32>,
@@ -562,11 +699,13 @@ impl OcrEngine {
         let size = model_size.to_string();
         let det_size = det_model_size.map(str::to_string);
         let rec_size = rec_model_size.map(str::to_string);
-        let engine = py.allow_threads(|| {
+        let dir = model_dir.map(str::to_string);
+        let (engine, det_source, rec_source, resolved_dir) = py.allow_threads(|| {
             new_engine(
                 &size,
                 det_size.as_deref(),
                 rec_size.as_deref(),
+                dir.as_deref(),
                 threads,
                 rec_batch,
                 det_max_side,
@@ -582,6 +721,9 @@ impl OcrEngine {
         })?;
         Ok(Self {
             inner: Mutex::new(engine),
+            det_source,
+            rec_source,
+            model_dir: resolved_dir,
         })
     }
 
@@ -665,6 +807,9 @@ impl OcrEngine {
         for (key, value) in models {
             out.set_item(key, value)?;
         }
+        out.set_item("det_source", self.det_source)?;
+        out.set_item("rec_source", self.rec_source)?;
+        out.set_item("model_dir", self.model_dir.clone())?;
         for (key, value) in settings {
             out.set_item(key, value)?;
         }
@@ -779,10 +924,10 @@ fn default_engine() -> PyResult<&'static Mutex<Engine>> {
     if let Some(e) = DEFAULT_ENGINE.get() {
         return Ok(e);
     }
-    let eng = new_engine(
-        "tiny", None, None, None, None, None, None, None, None, None, None, None, None, None,
+    let built = new_engine(
+        "tiny", None, None, None, None, None, None, None, None, None, None, None, None, None, None,
     )?;
-    Ok(DEFAULT_ENGINE.get_or_init(|| Mutex::new(eng)))
+    Ok(DEFAULT_ENGINE.get_or_init(|| Mutex::new(built.0)))
 }
 
 /// OCR multiple images with the shared default engine.
