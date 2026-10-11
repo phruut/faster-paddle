@@ -245,7 +245,7 @@ jobs:
 
   # Tag-only: attach the prebuilt wheels (+ sdist) to the GitHub release so
   # consumers can install without Rust/MSVC, e.g.
-  #   uv pip install https://github.com/phruut/faster-paddle/releases/download/v1.1.1/<wheel-file>
+  #   uv pip install https://github.com/phruut/faster-paddle/releases/download/v1.1.2/<wheel-file>
   # Gated on download-check so the two softprops/action-gh-release writers
   # (model-assets, then this) never race each other on the same tag.
   release:
