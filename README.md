@@ -1,4 +1,4 @@
-# faster-paddle
+# faster-paddle fork
 
 **Fast, CPU-only OCR in Rust with Python bindings**: a self-contained
 reimplementation of PaddleOCR's PP-OCRv6 detection + recognition pipeline with
@@ -50,7 +50,7 @@ filenames differ:
 | wheel file | inference | download | pick it when |
 |---|---|---|---|
 | `faster_paddle-1.2.1-...-win_amd64.whl` | ONNX Runtime, linked in | ~9 MB | you want the minimal install |
-| `faster_paddle_openvino-1.2.1-...-win_amd64.whl` | OpenVINO, DLLs bundled | ~20 MB (~65 MB installed) | you want lower latency |
+| `faster_paddle_openvino-1.2.1-...-win_amd64.whl` | OpenVINO, DLLs bundled | ~20 MB (~65 MB installed) | you want lower latency (not always) |
 
 Both are self-contained: no Python `onnxruntime`/`openvino` package, no
 `PATH` setup, no second install. Model weights download on first use either
