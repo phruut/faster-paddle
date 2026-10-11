@@ -1,9 +1,15 @@
-//! PP-OCRv6 tiny detection + recognition pipeline (CPU, ONNX Runtime).
+//! PP-OCRv6 detection + recognition pipeline: shared preprocessing,
+//! post-processing and CTC decode, plus the ONNX Runtime engine
+//! (`ort-backend`; the OpenVINO twin lives in `ov_backend.rs`).
 
 use crate::cv;
+#[cfg(feature = "ort-backend")]
 use ort::session::builder::GraphOptimizationLevel;
+#[cfg(feature = "ort-backend")]
 use ort::session::Session;
+#[cfg(feature = "ort-backend")]
 use ort::value::TensorRef;
+#[cfg(feature = "ort-backend")]
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -27,11 +33,13 @@ pub(crate) const REC_H: usize = 48;
 pub(crate) const REC_MAX_W: usize = 3200;
 // Singleton crops minimize measured CPU latency; the worker pool supplies
 // parallelism. The public override is a real cap, not a multiplier.
+#[cfg(feature = "ort-backend")]
 pub const DEFAULT_REC_BATCH: usize = 1;
 /// Recognition batch budget: a batch grows until `count * max_rec_width` exceeds
 /// this, so narrow crops batch together while wide line-crops run nearly alone
 /// (avoiding wasted padding compute). Tuned empirically: with one session per
 /// physical core, small batches (~1-2 average-width crops) minimise latency.
+#[cfg(feature = "ort-backend")]
 pub const REC_BATCH_BUDGET: usize = 800;
 
 pub struct OcrResult {
@@ -41,11 +49,13 @@ pub struct OcrResult {
     pub box4: [i32; 4],
 }
 
+#[cfg(feature = "ort-backend")]
 struct RecWorker {
     session: Session,
     input: Vec<f32>,
 }
 
+#[cfg(feature = "ort-backend")]
 pub struct Engine {
     det_model: String,
     rec_model: String,
@@ -86,6 +96,7 @@ pub struct ImageRgb {
     pub data: Vec<u8>,
 }
 
+#[cfg(feature = "ort-backend")]
 impl Engine {
     /// Build an engine from in-memory ONNX model bytes (bundled weights, local
     /// `model_dir` files, cache hits, or one-time downloads — resolved by the
@@ -540,6 +551,7 @@ impl Engine {
 }
 
 /// Run one recognition batch on a given session and CTC-decode it.
+#[cfg(feature = "ort-backend")]
 fn rec_batch_run(
     worker: &mut RecWorker,
     crops: &[ImageRgb],

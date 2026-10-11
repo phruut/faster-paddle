@@ -72,11 +72,15 @@ use numpy::{
     PyArray, PyArrayDescrMethods as _, PyArrayDyn, PyArrayMethods as _, PyUntypedArray,
     PyUntypedArrayMethods as _,
 };
-use ocr::{Engine, ImageRgb};
-/// Inference backend behind an engine. The default ORT path is unchanged;
-/// the OpenVINO twin is opt-in (`backend="ov"`, needs the
-/// `openvino-backend` cargo feature) and mirrors the ORT engine's API.
+#[cfg(feature = "ort-backend")]
+use ocr::Engine;
+use ocr::ImageRgb;
+/// Inference backend behind an engine. One backend is compiled per released
+/// wheel: ORT in the default wheel, OpenVINO in the `faster-paddle-openvino`
+/// wheel (`--no-default-features --features openvino-backend`). Enabling both
+/// features at once is possible for local A/B builds.
 enum BackendEngine {
+    #[cfg(feature = "ort-backend")]
     Ort(Engine),
     #[cfg(feature = "openvino-backend")]
     Ov(ov_backend::OvEngine),
@@ -85,6 +89,7 @@ enum BackendEngine {
 impl BackendEngine {
     fn workers(&self) -> Arc<rayon::ThreadPool> {
         match self {
+            #[cfg(feature = "ort-backend")]
             BackendEngine::Ort(e) => e.workers.clone(),
             #[cfg(feature = "openvino-backend")]
             BackendEngine::Ov(e) => e.workers.clone(),
@@ -93,6 +98,7 @@ impl BackendEngine {
 
     fn run(&mut self, img: &ImageRgb) -> Result<Vec<ocr::OcrResult>, String> {
         match self {
+            #[cfg(feature = "ort-backend")]
             BackendEngine::Ort(e) => e.run(img).map_err(|e| e.to_string()),
             #[cfg(feature = "openvino-backend")]
             BackendEngine::Ov(e) => e.run(img),
@@ -101,6 +107,7 @@ impl BackendEngine {
 
     fn run_many(&mut self, images: &[ImageRgb]) -> Result<Vec<Vec<ocr::OcrResult>>, String> {
         match self {
+            #[cfg(feature = "ort-backend")]
             BackendEngine::Ort(e) => e.run_many(images).map_err(|e| e.to_string()),
             #[cfg(feature = "openvino-backend")]
             BackendEngine::Ov(e) => e.run_many(images),
@@ -109,6 +116,7 @@ impl BackendEngine {
 
     fn rec(&mut self, crops: &[ImageRgb]) -> Result<Vec<(String, f32)>, String> {
         match self {
+            #[cfg(feature = "ort-backend")]
             BackendEngine::Ort(e) => e.rec(crops).map_err(|e| e.to_string()),
             #[cfg(feature = "openvino-backend")]
             BackendEngine::Ov(e) => e.rec(crops),
@@ -117,6 +125,7 @@ impl BackendEngine {
 
     fn det(&mut self, img: &ImageRgb) -> Result<Vec<[i32; 4]>, String> {
         match self {
+            #[cfg(feature = "ort-backend")]
             BackendEngine::Ort(e) => e.det(img).map_err(|e| e.to_string()),
             #[cfg(feature = "openvino-backend")]
             BackendEngine::Ov(e) => e.det(img),
@@ -125,6 +134,7 @@ impl BackendEngine {
 
     fn set_input_limits(&mut self, det_min: Option<i64>, rec_min: Option<usize>) {
         match self {
+            #[cfg(feature = "ort-backend")]
             BackendEngine::Ort(e) => e.set_input_limits(det_min, rec_min),
             #[cfg(feature = "openvino-backend")]
             BackendEngine::Ov(e) => e.set_input_limits(det_min, rec_min),
@@ -133,6 +143,7 @@ impl BackendEngine {
 
     fn settings(&self) -> Vec<(&'static str, usize)> {
         match self {
+            #[cfg(feature = "ort-backend")]
             BackendEngine::Ort(e) => e.settings(),
             #[cfg(feature = "openvino-backend")]
             BackendEngine::Ov(e) => e.settings(),
@@ -141,6 +152,7 @@ impl BackendEngine {
 
     fn model_names(&self) -> Vec<(&'static str, String)> {
         match self {
+            #[cfg(feature = "ort-backend")]
             BackendEngine::Ort(e) => e.model_names(),
             #[cfg(feature = "openvino-backend")]
             BackendEngine::Ov(e) => e.model_names(),
@@ -149,6 +161,7 @@ impl BackendEngine {
 
     fn det_settings(&self) -> Vec<(&'static str, f64)> {
         match self {
+            #[cfg(feature = "ort-backend")]
             BackendEngine::Ort(e) => e.det_settings(),
             #[cfg(feature = "openvino-backend")]
             BackendEngine::Ov(e) => e.det_settings(),
@@ -159,6 +172,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
+#[cfg(feature = "ort-backend")]
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -166,21 +180,22 @@ use std::sync::{Arc, Mutex, OnceLock};
 // The default wheel bundles nothing. Each size resolves as: local `model_dir`
 // file > embedded bytes (built with the matching `bundled-<size>` feature) >
 // cache hit > one-time GitHub release download (see `model_bytes`).
-// Dictionaries are kilobytes, so they stay always embedded.
-#[cfg(feature = "bundled-tiny")]
+// Dictionaries are kilobytes, so they stay always embedded. ONNX weight
+// resolution exists only in ORT builds; the OV backend resolves IR files.
+#[cfg(all(feature = "ort-backend", feature = "bundled-tiny"))]
 const TINY_DET: &[u8] = include_bytes!("../models/tiny/det.onnx");
-#[cfg(feature = "bundled-tiny")]
+#[cfg(all(feature = "ort-backend", feature = "bundled-tiny"))]
 const TINY_REC: &[u8] = include_bytes!("../models/tiny/rec.onnx");
 const TINY_DICT: &str = include_str!("../models/tiny/char_dict.json");
-#[cfg(feature = "bundled-small")]
+#[cfg(all(feature = "ort-backend", feature = "bundled-small"))]
 const SMALL_DET: &[u8] = include_bytes!("../models/small/det.onnx");
-#[cfg(feature = "bundled-small")]
+#[cfg(all(feature = "ort-backend", feature = "bundled-small"))]
 const SMALL_REC: &[u8] = include_bytes!("../models/small/rec.onnx");
 // small and medium share the same (larger) character dictionary
 const BIG_DICT: &str = include_str!("../models/small/char_dict.json");
-#[cfg(feature = "bundled-medium")]
+#[cfg(all(feature = "ort-backend", feature = "bundled-medium"))]
 const MEDIUM_DET: &[u8] = include_bytes!("../models/medium/det.onnx");
-#[cfg(feature = "bundled-medium")]
+#[cfg(all(feature = "ort-backend", feature = "bundled-medium"))]
 const MEDIUM_REC: &[u8] = include_bytes!("../models/medium/rec.onnx");
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -207,6 +222,7 @@ fn check_size(size: &str) -> PyResult<()> {
 }
 
 /// Embedded det weights, if this build bundles `size`.
+#[cfg(feature = "ort-backend")]
 fn bundled_det(size: &str) -> Option<&'static [u8]> {
     match size {
         #[cfg(feature = "bundled-tiny")]
@@ -220,6 +236,7 @@ fn bundled_det(size: &str) -> Option<&'static [u8]> {
 }
 
 /// Embedded rec weights, if this build bundles `size`.
+#[cfg(feature = "ort-backend")]
 fn bundled_rec(size: &str) -> Option<&'static [u8]> {
     match size {
         #[cfg(feature = "bundled-tiny")]
@@ -243,6 +260,7 @@ fn resolve_model_dir(explicit: Option<&str>) -> Option<std::path::PathBuf> {
 }
 
 /// Local `{model_dir}/{size}/{filename}` override, when present and plausible.
+#[cfg(feature = "ort-backend")]
 fn local_model_bytes(
     dir: Option<&std::path::Path>,
     size: &str,
@@ -261,6 +279,7 @@ fn local_dict(dir: Option<&std::path::Path>, size: &str) -> Option<String> {
 
 /// Release asset names must match the files attached to the GitHub release
 /// (see the `model-assets` CI job).
+#[cfg(feature = "ort-backend")]
 fn det_asset(size: &str) -> &'static str {
     match size {
         "tiny" => "ppocrv6_tiny_det.onnx",
@@ -269,6 +288,7 @@ fn det_asset(size: &str) -> &'static str {
     }
 }
 
+#[cfg(feature = "ort-backend")]
 fn rec_asset(size: &str) -> &'static str {
     match size {
         "tiny" => "ppocrv6_tiny_rec.onnx",
@@ -280,6 +300,7 @@ fn rec_asset(size: &str) -> &'static str {
 /// Per-side model lookups so det and rec sizes can be mixed in one engine.
 /// Also returns where the weights came from (`local`, `bundled`, `cached`,
 /// `downloaded`) for `config` diagnostics.
+#[cfg(feature = "ort-backend")]
 fn resolve_det(
     size: &str,
     model_dir: Option<&std::path::Path>,
@@ -296,6 +317,7 @@ fn resolve_det(
     Ok((Cow::Owned(bytes), thresh, source))
 }
 
+#[cfg(feature = "ort-backend")]
 fn resolve_rec(
     size: &str,
     model_dir: Option<&std::path::Path>,
@@ -342,6 +364,7 @@ fn cache_dir_for(size: &str) -> PyResult<std::path::PathBuf> {
 
 /// Cache hit or one-time download of a non-bundled ONNX file. Returns the
 /// bytes and whether they were `cached` or `downloaded`.
+#[cfg(feature = "ort-backend")]
 fn model_bytes(size: &str, filename: &str, asset: &str) -> PyResult<(Vec<u8>, &'static str)> {
     let cache = cache_dir_for(size)?;
     let path = cache.join(filename);
@@ -353,6 +376,7 @@ fn model_bytes(size: &str, filename: &str, asset: &str) -> PyResult<(Vec<u8>, &'
     Ok((fetch_cached(&cache, filename, asset, size)?, "downloaded"))
 }
 
+#[cfg(feature = "ort-backend")]
 fn fetch_cached(
     cache_dir: &std::path::Path,
     filename: &str,
@@ -649,6 +673,18 @@ fn env_bool(name: &str) -> Option<bool> {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+/// Backend used when the caller passes none: the wheel's compiled runtime.
+fn default_backend() -> &'static str {
+    #[cfg(feature = "ort-backend")]
+    {
+        "ort"
+    }
+    #[cfg(not(feature = "ort-backend"))]
+    {
+        "ov"
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn new_engine(
     backend: &str,
@@ -782,41 +818,49 @@ fn new_engine(
              (plus OpenVINO native libs at build time)",
         ));
     }
-    let (det_bytes, box_default, det_source) = resolve_det(det_size, dir.as_deref())?;
-    let (rec_bytes, dict, rec_source) = resolve_rec(rec_size, dir.as_deref())?;
-    let rb = rec_batch.unwrap_or(ocr::DEFAULT_REC_BATCH);
-    let det_box_thresh = det_box_thresh
-        .or_else(|| env_float("OCR_DET_BOX_THRESH").map(|v| v as f32))
-        .unwrap_or(box_default);
-    if !(0.0..=1.0).contains(&det_box_thresh) {
-        return Err(PyValueError::new_err(
-            "det_box_thresh must be between 0.0 and 1.0",
-        ));
+    #[cfg(not(feature = "ort-backend"))]
+    return Err(PyRuntimeError::new_err(
+        "backend=\"ort\" is not available in this OpenVINO-only build; \
+         install the default faster-paddle wheel for ONNX Runtime",
+    ));
+    #[cfg(feature = "ort-backend")]
+    {
+        let (det_bytes, box_default, det_source) = resolve_det(det_size, dir.as_deref())?;
+        let (rec_bytes, dict, rec_source) = resolve_rec(rec_size, dir.as_deref())?;
+        let rb = rec_batch.unwrap_or(ocr::DEFAULT_REC_BATCH);
+        let det_box_thresh = det_box_thresh
+            .or_else(|| env_float("OCR_DET_BOX_THRESH").map(|v| v as f32))
+            .unwrap_or(box_default);
+        if !(0.0..=1.0).contains(&det_box_thresh) {
+            return Err(PyValueError::new_err(
+                "det_box_thresh must be between 0.0 and 1.0",
+            ));
+        }
+        let mut engine = BackendEngine::Ort(
+            Engine::from_memory(
+                det_size,
+                rec_size,
+                &det_bytes,
+                &rec_bytes,
+                dict,
+                t,
+                det_t,
+                rb,
+                det_box_thresh,
+                det_thresh,
+                det_unclip_ratio,
+                det_max_candidates,
+                text_score,
+                det_use_dilation,
+                pool,
+                det_max,
+            )
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to init OCR engine: {e}")))?,
+        );
+        engine.set_input_limits(det_min_side, Some(width));
+        let dir_str = dir.map(|p| p.to_string_lossy().into_owned());
+        Ok((engine, det_source, rec_source, dir_str))
     }
-    let mut engine = BackendEngine::Ort(
-        Engine::from_memory(
-            det_size,
-            rec_size,
-            &det_bytes,
-            &rec_bytes,
-            dict,
-            t,
-            det_t,
-            rb,
-            det_box_thresh,
-            det_thresh,
-            det_unclip_ratio,
-            det_max_candidates,
-            text_score,
-            det_use_dilation,
-            pool,
-            det_max,
-        )
-        .map_err(|e| PyRuntimeError::new_err(format!("failed to init OCR engine: {e}")))?,
-    );
-    engine.set_input_limits(det_min_side, Some(width));
-    let dir_str = dir.map(|p| p.to_string_lossy().into_owned());
-    Ok((engine, det_source, rec_source, dir_str))
 }
 
 /// OpenVINO twin of the ORT construction path: same knobs, IR weights instead
@@ -1154,12 +1198,13 @@ impl OcrEngine {
     ///     det_max_candidates: max det boxes kept (default 3000).
     ///     text_score: drop reads below this conf (default 0.0 keep-all).
     ///     det_use_dilation: 2x2 mask dilate before components (default False).
-    ///     backend: inference runtime, "ort" (default) or "ov". "ov" needs the
-    ///         `openvino-backend` build plus IR weights (`{dir}/{size}/det.xml`,
+    ///     backend: inference runtime; defaults to the wheel's compiled
+    ///         backend ("ort" in the default wheel, "ov" in the OpenVINO
+    ///         wheel). "ov" needs IR weights (`{dir}/{size}/det.xml`,
     ///         `det.bin`, `rec.xml`, `rec.bin` in `OV_IR_DIR` or `model_dir`);
     ///         its `rec_batch` is always singleton regardless of the argument.
     #[new]
-    #[pyo3(signature = (model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_model_size=None, rec_model_size=None, model_dir=None, det_min_side=None, rec_min_width=None, det_thresh=None, det_box_thresh=None, det_unclip_ratio=None, det_max_candidates=None, text_score=None, det_use_dilation=None, backend="ort"))]
+    #[pyo3(signature = (model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_model_size=None, rec_model_size=None, model_dir=None, det_min_side=None, rec_min_width=None, det_thresh=None, det_box_thresh=None, det_unclip_ratio=None, det_max_candidates=None, text_score=None, det_use_dilation=None, backend=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -1178,17 +1223,25 @@ impl OcrEngine {
         det_max_candidates: Option<usize>,
         text_score: Option<f32>,
         det_use_dilation: Option<bool>,
-        backend: &str,
+        backend: Option<&str>,
     ) -> PyResult<Self> {
         // Model construction and downloads run without holding the GIL.
-        let backend_owned = backend.to_string();
+        let backend_static: &'static str = match backend {
+            Some("ov") => "ov",
+            Some(_) => "ort",
+            None => default_backend(),
+        };
+        let backend: &str = match backend {
+            Some(name) => name,
+            None => default_backend(),
+        };
         let size = model_size.to_string();
         let det_size = det_model_size.map(str::to_string);
         let rec_size = rec_model_size.map(str::to_string);
         let dir = model_dir.map(str::to_string);
         let (engine, det_source, rec_source, resolved_dir) = py.allow_threads(|| {
             new_engine(
-                &backend_owned,
+                backend,
                 &size,
                 det_size.as_deref(),
                 rec_size.as_deref(),
@@ -1206,7 +1259,6 @@ impl OcrEngine {
                 det_use_dilation,
             )
         })?;
-        let backend_static: &'static str = if backend_owned == "ov" { "ov" } else { "ort" };
         Ok(Self {
             inner: Mutex::new(engine),
             backend: backend_static,
@@ -1466,8 +1518,8 @@ fn default_engine() -> PyResult<&'static Mutex<BackendEngine>> {
         return Ok(e);
     }
     let built = new_engine(
-        "ort", "tiny", None, None, None, None, None, None, None, None, None, None, None, None,
-        None, None,
+        default_backend(), "tiny", None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None,
     )?;
     Ok(DEFAULT_ENGINE.get_or_init(|| Mutex::new(built.0)))
 }
@@ -1608,7 +1660,20 @@ fn py_prepare<'py>(
 #[pymodule]
 fn faster_paddle(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    #[cfg(feature = "ort-backend")]
     m.add("__runtime_build__", ort::info())?;
+    #[cfg(all(feature = "openvino-backend", not(feature = "ort-backend")))]
+    m.add("__runtime_build__", ov_backend::runtime_version())?;
+    // Compiled inference backends: the default wheel ships "ort", the
+    // OpenVINO wheel ships "ov". A/B dev builds can carry both.
+    let backends: Vec<&str> = [
+        (cfg!(feature = "ort-backend"), "ort"),
+        (cfg!(feature = "openvino-backend"), "ov"),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, name)| enabled.then_some(name))
+    .collect();
+    m.add("__backends__", backends)?;
     m.add_class::<OcrEngine>()?;
     m.add_function(wrap_pyfunction!(py_ocr, m)?)?;
     m.add_function(wrap_pyfunction!(py_ocr_batch, m)?)?;

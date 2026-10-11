@@ -1,6 +1,6 @@
 [package]
 name = "faster_paddle"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 license = "MIT"
 description = "Fast CPU OCR (PaddleOCR PP-OCRv6 tiny/small/medium) with Python bindings, powered by ONNX Runtime or OpenVINO."
@@ -16,12 +16,16 @@ name = "faster_paddle"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
+# Default wheel: ONNX Runtime only. The OpenVINO wheel is built with
+# `--no-default-features --features openvino-backend` so each release wheel
+# ships exactly one runtime; enabling both together is for local A/B builds.
+default = ["ort-backend"]
+ort-backend = ["dep:ort"]
 bundled-tiny = []
 bundled-small = []
 bundled-medium = []
 bundled-all = ["bundled-tiny", "bundled-small", "bundled-medium"]
-# Opt-in OpenVINO inference backend (parallel to the default ONNX Runtime
+# Opt-in OpenVINO inference backend (instead of the default ONNX Runtime
 # backend). Requires OpenVINO native libs at build time (see src/ov_backend.rs);
 # default builds never compile it.
 openvino-backend = ["dep:openvino", "dep:openvino-sys"]
@@ -31,8 +35,9 @@ pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
 numpy = "0.23"
 # default features minus `tls-native` (which pulls openssl-sys and breaks
 # dependency-free cross-platform wheel builds); use rustls for the model
-# downloader instead.
-ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+# downloader instead. Optional so the OpenVINO wheel can leave ONNX Runtime
+# (and its binaries) out entirely.
+ort = { version = "=2.0.0-rc.13", default-features = false, optional = true, features = [
     "std",
     "ndarray",
     "tracing",

@@ -1,8 +1,9 @@
-"""OpenVINO backend tests (opt-in).
+"""OpenVINO backend tests (opt-in wheel).
 
-Skipped unless the extension was built with `--features openvino-backend`
-and IR weights are reachable (`{OV_IR_DIR or model_dir}/{size}/det.xml` etc,
-or downloadable from the release host).
+Skipped unless the extension was built with the OpenVINO backend
+(`--no-default-features --features openvino-backend`) and IR weights are
+reachable (`{OV_IR_DIR or model_dir}/{size}/det.xml` etc, or downloadable from
+the release host).
 
 The OV backend trades bit-parity for speed: detector masks agree to ~1px
 and recognizer numerics drift on CTC-fragile crops, so these tests assert
@@ -69,3 +70,15 @@ def test_ov_deterministic():
     e = _ov_engine(model_size="tiny")
     first = e.ocr(data)["text"]
     assert e.ocr(data)["text"] == first
+
+
+def test_ov_only_wheel_has_no_ort():
+    """The OpenVINO wheel ships OpenVINO only; ORT builds never report "ov" as
+    their default backend."""
+    backends = tuple(getattr(faster_paddle, "__backends__", ("ort", "ov")))
+    if "ort" in backends:
+        pytest.skip("build also carries ONNX Runtime (local A/B build)")
+    with pytest.raises(RuntimeError, match="OpenVINO-only"):
+        faster_paddle.OcrEngine(backend="ort")
+    assert "OpenVINO" in faster_paddle.__runtime_build__
+    assert faster_paddle.OcrEngine().config["backend"] == "ov"

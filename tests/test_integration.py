@@ -11,11 +11,19 @@ import os
 import time
 
 import faster_paddle
+import pytest
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURE = os.path.join(HERE, "fixtures", "document.png")  # two-pane UI screenshot
 MODELS_DIR = os.path.abspath(os.path.join(HERE, "..", "models"))
+
+# Wheels ship exactly one backend: "ort" (default) or "ov" (faster-paddle-openvino).
+# Older builds predate the module attribute and always include ORT.
+BACKENDS = tuple(getattr(faster_paddle, "__backends__", ("ort",)))
+requires_ort = pytest.mark.skipif(
+    "ort" not in BACKENDS, reason="this wheel has no ONNX Runtime backend"
+)
 
 
 def _small():
@@ -23,6 +31,7 @@ def _small():
         return f.read()
 
 
+@requires_ort
 def test_bundled_runtime():
     # Verify the linked native runtime, not just the Rust crate/package version.
     assert "1.28.0" in faster_paddle.__runtime_build__
@@ -173,7 +182,6 @@ def test_batch_preprocessing_maps_each_image_separately():
 
 
 def test_invalid_options_and_batch_errors():
-    import pytest
     for kw in ({"threads": 0}, {"rec_batch": 0}, {"det_max_side": 16},
                {"det_min_side": -1}, {"rec_min_width": 32}):
         with pytest.raises(ValueError):
@@ -188,6 +196,7 @@ def test_invalid_options_and_batch_errors():
     assert eng.ocr(_small())["bounds"]  # an error must not poison the engine
 
 
+@requires_ort
 def test_resolved_cpu_budget_and_batch_cap():
     from unittest.mock import patch
     with patch.dict(os.environ, {"REC_POOL": "100", "OCR_DET_THREADS": "100", "RAYON_NUM_THREADS": "100"}):
@@ -241,6 +250,7 @@ def test_short_labels_with_model_specific_padding():
         assert Counter(eng.ocr(data)["text"].split()) == Counter(labels.split())
 
 
+@requires_ort
 def test_sparse_wide_jobs_match_batch_text_and_boxes():
     data = open(os.path.join(HERE, "fixtures", "long-line.png"), "rb").read()
     signature = lambda r: [(b["topLeftCoord"], b["bottomRightCoord"], b["text"]) for b in r["bounds"].values()]
@@ -284,7 +294,6 @@ def test_det_knobs_shift_output():
 
 
 def test_det_config_round_trips():
-    import pytest
     eng = faster_paddle.OcrEngine(
         model_size="tiny", threads=2,
         det_thresh=0.3, det_box_thresh=0.5, det_unclip_ratio=1.6,
@@ -305,7 +314,6 @@ def test_det_config_round_trips():
 
 
 def test_det_invalid_values():
-    import pytest
     for kw in ({"det_thresh": -0.1}, {"det_thresh": 1.5},
                {"det_box_thresh": -0.1}, {"det_box_thresh": 1.5},
                {"det_unclip_ratio": -1.0}, {"det_unclip_ratio": 5.5},
@@ -372,7 +380,6 @@ def test_det_use_dilation_config_and_batch():
 
 
 def test_rec_only_reads_precropped_lines():
-    import pytest
     eng = faster_paddle.OcrEngine(model_size="tiny", threads=2)
     assert eng.rec([]) == []
     data = _small()
@@ -400,7 +407,6 @@ def test_rec_only_reads_precropped_lines():
 
 
 def test_det_only_matches_ocr_boxes():
-    import pytest
     eng = faster_paddle.OcrEngine(model_size="tiny", threads=2)
     data = _small()
     full = eng.ocr(data)
@@ -417,7 +423,6 @@ def test_det_only_matches_ocr_boxes():
 
 
 def test_mixed_model_sizes():
-    import pytest
     data = _small()
     # mixed engine: tiny det + small rec
     mixed = faster_paddle.OcrEngine(
@@ -455,6 +460,7 @@ def test_mixed_model_sizes():
         faster_paddle.OcrEngine(model_size="huge")
 
 
+@requires_ort
 def test_model_dir_loads_local_models_offline():
     # a code-only build stays fully offline when pointed at local weights
     eng = faster_paddle.OcrEngine(model_size="tiny", threads=2, model_dir=MODELS_DIR)
@@ -476,10 +482,10 @@ def test_model_dir_loads_local_models_offline():
     assert _signature(mixed.ocr(data)) == expected
 
 
+@requires_ort
 def test_model_dir_env_var_and_arg_precedence():
     from unittest.mock import patch
 
-    import pytest
     data = _small()
     before = os.environ.get("FASTER_PADDLE_MODEL_DIR")
     with patch.dict(os.environ, {"FASTER_PADDLE_MODEL_DIR": MODELS_DIR}):

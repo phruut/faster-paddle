@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "faster-paddle"
-version = "1.2.0"
+version = "1.2.1"
 description = "Fast CPU OCR — PaddleOCR PP-OCRv6 tiny/small/medium in Rust, with ONNX Runtime or OpenVINO inference, hardware-aware scheduling and multi-image recognition."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -31,10 +31,10 @@ module-name = "faster_paddle"
 python-source = "python"
 features = ["pyo3/extension-module"]
 strip = true
-# OpenVINO wheel (`--features openvino-backend`): build.rs stages the vendored
-# CPU runtime flat into $OUT_DIR, and this include drops it into the package
-# beside the extension (flat: plugin discovery resolves relative to
-# plugins.xml). Matches nothing for default builds.
+# OpenVINO wheel (`--no-default-features --features openvino-backend`):
+# build.rs stages the vendored CPU runtime flat into $OUT_DIR, and this include
+# drops it into the package beside the extension (flat: plugin discovery
+# resolves relative to plugins.xml). Matches nothing for ORT-only builds.
 include = [{ path = "*", from = "out-dir", to = "faster_paddle/" }]
 # Bundled model bytes (if any, via `--features bundled-*`) live in the
 # extension. Cargo.toml includes the source assets in sdists; duplicating
