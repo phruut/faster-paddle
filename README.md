@@ -60,11 +60,39 @@ engine = OcrEngine(model_size="tiny", threads=None, det_max_side=1600)
 
 result = engine.ocr(image_bytes)                 # raw jpeg/png/webp/bmp/tiff/gif bytes
 result = engine.ocr_base64(b64_string)           # base64-encoded image
+result = engine.ocr(np_array)                    # uint8 numpy array, no encode/decode
 ```
+
+### Raw pixel input (numpy)
+
+`ocr`, `ocr_batch`, `det`, `rec`, and `prepare` also accept uint8 numpy
+arrays directly — useful for OpenCV frames, PIL images, and video loops,
+where encoding to PNG/JPG just to decode it again is wasted work:
+
+```python
+import numpy as np
+from PIL import Image
+
+arr = np.asarray(Image.open("document.jpg").convert("RGB"))  # (H, W, 3) RGB
+result = engine.ocr(arr)
+
+bgr = cv2.imread("document.jpg")                 # (H, W, 3) BGR from OpenCV
+result = engine.ocr(bgr, colorspace="bgr")
+
+gray = np.asarray(Image.open("document.jpg").convert("L"))  # (H, W) grayscale
+result = engine.ocr(gray)  # (H, W, 4) RGBA also works; 4-channel uses BGRA order with colorspace="bgr"
+```
+
+Arrays must be `uint8` and C-contiguous (`np.ascontiguousarray` if needed).
+`colorspace="rgb"` (default) or `"bgr"` applies to 3-channel (and 4-channel)
+arrays; encoded bytes are always decoded as RGB. `prepare(..., return_array=True)`
+returns a `(H, W, 3)` array instead of PNG bytes, so `prepare` → `ocr` chains
+stay in pixel space with no codec round-trip.
 
 ### Multiple images
 
-Available in **v1.0.2 and later**. Pass a list of encoded image bytes and get
+Available in **v1.0.2 and later**. Pass a list of encoded image bytes or numpy
+arrays (see Raw pixel input) and get
 one result dictionary per image, in the same order:
 
 ```python
@@ -231,17 +259,21 @@ Setting                                            Value
 
 | | |
 |---|---|
-| `faster_paddle.ocr(image, resize=False, denoise=False, deskew=False, binarize=False) -> dict` | OCR encoded image bytes (shared default engine). |
-| `faster_paddle.ocr_batch(images, *, batch_size=4, resize=False, denoise=False, deskew=False, binarize=False) -> list[dict]` | OCR multiple encoded images; results preserve input order. |
+| `faster_paddle.ocr(image, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb") -> dict` | OCR encoded image bytes or a uint8 numpy array (shared default engine). |
+| `faster_paddle.ocr_batch(images, *, batch_size=4, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb") -> list[dict]` | OCR multiple encoded images/arrays; results preserve input order. |
 | `faster_paddle.ocr_base64(image_base64, resize=False, denoise=False, deskew=False, binarize=False) -> dict` | OCR a base64 image string. |
 | `OcrEngine(model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_model_size=None, rec_model_size=None, model_dir=None, det_min_side=None, rec_min_width=None)` | Construct a reusable engine. |
-| `OcrEngine.ocr(image, resize=False, denoise=False, deskew=False, binarize=False) -> dict` | OCR encoded image bytes. |
-| `OcrEngine.ocr_batch(images, *, batch_size=4, resize=False, denoise=False, deskew=False, binarize=False) -> list[dict]` | OCR multiple encoded images; results preserve input order. |
-| `OcrEngine.rec(crops) -> list[{"text": str, "confidence": float}]` | Recognize pre-cropped line images, skipping detection; input order preserved. |
-| `OcrEngine.det(image) -> list[{"topLeftCoord": (x1, y1), "bottomRightCoord": (x2, y2)}]` | Detect text boxes without recognizing; needs only the detection model. |
+| `OcrEngine.ocr(image, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb") -> dict` | OCR encoded image bytes or a uint8 numpy array. |
+| `OcrEngine.ocr_batch(images, *, batch_size=4, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb") -> list[dict]` | OCR multiple encoded images/arrays; results preserve input order. |
+| `OcrEngine.rec(crops, colorspace="rgb") -> list[{"text": str, "confidence": float}]` | Recognize pre-cropped line images (bytes or arrays), skipping detection; input order preserved. |
+| `OcrEngine.det(image, colorspace="rgb") -> list[{"topLeftCoord": (x1, y1), "bottomRightCoord": (x2, y2)}]` | Detect text boxes without recognizing; needs only the detection model. |
 | `OcrEngine.ocr_base64(image_base64, resize=False, denoise=False, deskew=False, binarize=False) -> dict` | OCR a base64 image string. |
-| `faster_paddle.prepare(image, resize=False, denoise=False, deskew=False, binarize=False) -> bytes` | Preprocess only; returns PNG bytes (no OCR). |
-| `OcrEngine.prepare(image, resize=False, denoise=False, deskew=False, binarize=False) -> bytes` | Preprocess only; returns PNG bytes (no OCR). |
+| `faster_paddle.prepare(image, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb", return_array=False) -> bytes` | Preprocess only; PNG bytes by default, `(H, W, 3)` numpy array with `return_array=True` (no OCR). |
+| `OcrEngine.prepare(image, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb", return_array=False) -> bytes` | Preprocess only; PNG bytes by default, `(H, W, 3)` numpy array with `return_array=True` (no OCR). |
+
+- `image`/`images`/`crops`: encoded `bytes` (jpeg/png/webp/bmp/tiff/gif) or a
+  C-contiguous `uint8` numpy array — `(H, W, 3)` RGB/BGR, `(H, W)` gray, or
+  `(H, W, 4)` RGBA/BGRA (see Raw pixel input).
 
 - `resize`/`denoise`/`deskew`/`binarize`: optional preprocessing (see above).
 - `model_size`: `"tiny"` (default), `"small"`, or `"medium"`.
@@ -344,8 +376,8 @@ python -m pytest tests -q
 The tests cover geometry equivalence, fused resize/padding, recognition caps,
 known text, both small models, batch ordering and transforms, buffer reuse,
 concurrent calls, error recovery, CPU affinity/budgets, and preprocessing. CI
-runs Rust and Python tests before publishing. Install `pytest` and `pillow`
-for the Python suite. Performance comparisons live under `benchmarks/`; the
+runs Rust and Python tests before publishing. Install `pytest`, `pillow`, and
+`numpy` for the Python suite. Performance comparisons live under `benchmarks/`; the
 small bundled test corpus is not a comprehensive OCR accuracy benchmark.
 
 ## License

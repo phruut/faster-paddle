@@ -66,6 +66,10 @@ mod glibc_compat {
 }
 
 use base64::Engine as _;
+use numpy::{
+    PyArray, PyArrayDescrMethods as _, PyArrayDyn, PyArrayMethods as _, PyUntypedArray,
+    PyUntypedArrayMethods as _,
+};
 use ocr::{Engine, ImageRgb};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -302,6 +306,144 @@ fn decode_rgb(bytes: &[u8]) -> Result<ImageRgb, String> {
     })
 }
 
+/// Channel order of a 3-channel array input.
+#[derive(Clone, Copy, PartialEq)]
+enum ColorSpace {
+    Rgb,
+    Bgr,
+}
+
+fn parse_colorspace(s: &str) -> Result<ColorSpace, String> {
+    match s {
+        "rgb" => Ok(ColorSpace::Rgb),
+        "bgr" => Ok(ColorSpace::Bgr),
+        other => Err(format!(
+            "unknown colorspace {other:?}; expected 'rgb' or 'bgr'"
+        )),
+    }
+}
+
+/// One OCR input, already separated (under the GIL) into encoded bytes or raw
+/// pixels. Bytes still decode in parallel without the GIL; pixels skip decode.
+enum RawInput {
+    Encoded(PyBackedBytes),
+    Pixels(ImageRgb),
+}
+
+/// Split a `bytes | numpy.ndarray` argument. The ndarray branch is checked
+/// first so buffer-like arrays never fall through to the bytes path.
+fn extract_input(obj: &Bound<'_, PyAny>, colorspace: ColorSpace) -> Result<RawInput, String> {
+    if obj.downcast::<PyUntypedArray>().is_ok() {
+        return image_from_numpy(obj, colorspace).map(RawInput::Pixels);
+    }
+    match obj.extract::<PyBackedBytes>() {
+        Ok(bytes) => Ok(RawInput::Encoded(bytes)),
+        Err(_) => Err(
+            "expected image bytes (jpeg/png/webp/bmp/tiff/gif) or a uint8 numpy array \
+             with shape (H, W, 3), (H, W), or (H, W, 4)"
+                .to_string(),
+        ),
+    }
+}
+
+/// Copy a uint8 array into an RGB buffer: `(H, W, 3)` is moved (or BGR-swapped),
+/// `(H, W)` gray is expanded, `(H, W, 4)` drops alpha (BGRA when bgr).
+fn image_from_numpy(obj: &Bound<'_, PyAny>, colorspace: ColorSpace) -> Result<ImageRgb, String> {
+    let untyped = obj
+        .downcast::<PyUntypedArray>()
+        .map_err(|_| "expected a numpy array".to_string())?;
+    if !untyped
+        .dtype()
+        .is_equiv_to(&numpy::dtype::<u8>(obj.py()))
+    {
+        return Err("expected a uint8 numpy array (dtype uint8)".to_string());
+    }
+    let shape = untyped.shape().to_vec();
+    let (h, w, channels) = match shape.as_slice() {
+        [h, w] => (*h, *w, 1),
+        [h, w, c] if *c == 3 || *c == 4 => (*h, *w, *c),
+        _ => {
+            return Err(format!(
+                "expected array shape (H, W, 3), (H, W), or (H, W, 4); got {shape:?}"
+            ))
+        }
+    };
+    if h == 0 || w == 0 {
+        return Err("array must have nonzero height and width".to_string());
+    }
+    let n = h
+        .checked_mul(w)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or("array dimensions are too large".to_string())?;
+    let arr = obj
+        .downcast::<PyArrayDyn<u8>>()
+        .map_err(|e| e.to_string())?;
+    let view = arr.readonly();
+    let flat = view.as_slice().map_err(|_| {
+        "array must be C-contiguous; try np.ascontiguousarray(arr)".to_string()
+    })?;
+    if flat.len() != h * w * channels {
+        return Err(format!(
+            "array data length {} does not match shape {shape:?}",
+            flat.len()
+        ));
+    }
+    let bgr = colorspace == ColorSpace::Bgr;
+    let data = match channels {
+        1 => {
+            let mut data = vec![0u8; n];
+            for (px, &g) in data.chunks_exact_mut(3).zip(flat.iter()) {
+                px[0] = g;
+                px[1] = g;
+                px[2] = g;
+            }
+            data
+        }
+        3 if !bgr => flat.to_vec(),
+        3 => {
+            let mut data = flat.to_vec();
+            for px in data.chunks_exact_mut(3) {
+                px.swap(0, 2);
+            }
+            data
+        }
+        _ => {
+            let mut data = Vec::with_capacity(n);
+            for px in flat.chunks_exact(4) {
+                if bgr {
+                    data.extend_from_slice(&[px[2], px[1], px[0]]);
+                } else {
+                    data.extend_from_slice(&px[..3]);
+                }
+            }
+            data
+        }
+    };
+    Ok(ImageRgb { w, h, data })
+}
+
+/// Own the pixels behind a RawInput (decoding bytes when needed).
+fn raw_to_image(raw: &RawInput) -> Result<ImageRgb, String> {
+    match raw {
+        RawInput::Encoded(bytes) => decode_rgb(bytes),
+        RawInput::Pixels(img) => Ok(ImageRgb {
+            w: img.w,
+            h: img.h,
+            data: img.data.clone(),
+        }),
+    }
+}
+
+/// Export an RGB image as a C-contiguous `(H, W, 3)` uint8 array.
+fn image_to_pyarray<'py>(py: Python<'py>, img: &ImageRgb) -> Bound<'py, PyArray<u8, numpy::ndarray::Ix3>> {
+    let arr = PyArray::<u8, numpy::ndarray::Ix3>::zeros(py, (img.h, img.w, 3), false);
+    arr.readwrite()
+        .as_slice_mut()
+        .expect("fresh C-order array is contiguous")
+        .copy_from_slice(&img.data);
+    arr
+}
+
 /// Encode an RGB image to PNG bytes. If the image is grayscale (all channels
 /// equal, e.g. after denoise/deskew/binarize) it is written as a smaller 8-bit
 /// grayscale PNG; otherwise as RGB.
@@ -329,15 +471,29 @@ fn encode_png(img: ImageRgb) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Run the (enabled) preprocessing steps and return the prepared image as PNG
-/// bytes. Returns the original bytes unchanged when no option is enabled.
-fn prepare_bytes(image: &[u8], opts: preprocess::PreOpts) -> Result<Vec<u8>, String> {
+/// Prepared image, either as PNG bytes (default) or raw pixels when the
+/// caller asked for an array (avoids a PNG round-trip before `ocr`).
+enum Prepared {
+    Bytes(Vec<u8>),
+    Pixels(ImageRgb),
+}
+
+/// Run the (enabled) preprocessing steps. With no option enabled, bytes pass
+/// through unchanged and arrays only convert layouts (no resampling).
+fn prepare_raw(raw: &RawInput, opts: preprocess::PreOpts, return_array: bool) -> Result<Prepared, String> {
     if !opts.any() {
-        return Ok(image.to_vec());
+        return match raw {
+            RawInput::Encoded(bytes) if !return_array => Ok(Prepared::Bytes(bytes.to_vec())),
+            raw => raw_to_image(raw).map(Prepared::Pixels),
+        };
     }
-    let img = decode_rgb(image)?;
+    let img = raw_to_image(raw)?;
     let (processed, _transform) = preprocess::preprocess(img, &opts);
-    encode_png(processed)
+    if return_array {
+        Ok(Prepared::Pixels(processed))
+    } else {
+        encode_png(processed).map(Prepared::Bytes)
+    }
 }
 
 fn env_usize(name: &str) -> Option<usize> {
@@ -492,12 +648,12 @@ type RawResult = (
 
 fn run_ocr(
     engine: &Mutex<Engine>,
-    bytes: &[u8],
+    raw: &RawInput,
     opts: preprocess::PreOpts,
 ) -> Result<RawResult, String> {
     let dbg = std::env::var("OCR_DEBUG").is_ok();
     let t0 = std::time::Instant::now();
-    let img = decode_rgb(bytes)?;
+    let img = raw_to_image(raw)?;
     if dbg {
         eprintln!(
             "[dbg] decode ({}x{}): {:.3}s",
@@ -548,22 +704,23 @@ fn finish_ocr(res: Vec<ocr::OcrResult>, transform: preprocess::Transform) -> Raw
 }
 
 /// Decode bounded windows in parallel, then share recognition work across pages.
+/// Array inputs skip decoding; bytes decode here without the GIL.
 fn run_ocr_batch(
     engine: &Mutex<Engine>,
-    images: &[PyBackedBytes],
+    raws: &[RawInput],
     opts: preprocess::PreOpts,
     batch_size: usize,
 ) -> Result<Vec<RawResult>, String> {
     use rayon::prelude::*;
     let workers = engine.lock().map_err(|e| e.to_string())?.workers.clone();
-    let mut output = Vec::with_capacity(images.len());
-    for chunk in images.chunks(batch_size) {
+    let mut output = Vec::with_capacity(raws.len());
+    for chunk in raws.chunks(batch_size) {
         let prepared: Result<Vec<_>, String> = workers.install(|| {
             chunk
                 .par_iter()
                 .enumerate()
-                .map(|(i, bytes)| {
-                    let img = decode_rgb(bytes)
+                .map(|(i, raw)| {
+                    let img = raw_to_image(raw)
                         .map_err(|e| format!("image {}: {e}", output.len() + i))?;
                     Ok(preprocess::preprocess(img, &opts))
                 })
@@ -587,17 +744,16 @@ fn run_ocr_batch(
 }
 
 /// Decode crops and read each one in order; `(text, confidence)` per crop, unfiltered.
-fn run_rec(engine: &Mutex<Engine>, crops: &[PyBackedBytes]) -> Result<Vec<(String, f32)>, String> {
+fn run_rec(engine: &Mutex<Engine>, raws: &[RawInput]) -> Result<Vec<(String, f32)>, String> {
     use rayon::prelude::*;
-    if crops.is_empty() {
+    if raws.is_empty() {
         return Ok(Vec::new());
     }
     let workers = engine.lock().map_err(|e| e.to_string())?.workers.clone();
     let imgs: Result<Vec<ImageRgb>, String> = workers.install(|| {
-        crops
-            .par_iter()
+        raws.par_iter()
             .enumerate()
-            .map(|(i, bytes)| decode_rgb(bytes).map_err(|e| format!("crop {i}: {e}")))
+            .map(|(i, raw)| raw_to_image(raw).map_err(|e| format!("crop {i}: {e}")))
             .collect()
     });
     engine
@@ -608,8 +764,8 @@ fn run_rec(engine: &Mutex<Engine>, crops: &[PyBackedBytes]) -> Result<Vec<(Strin
 }
 
 /// Detect text boxes without recognizing; boxes are in source-image coordinates.
-fn run_det(engine: &Mutex<Engine>, image: &[u8]) -> Result<Vec<[i32; 4]>, String> {
-    let img = decode_rgb(image)?;
+fn run_det(engine: &Mutex<Engine>, raw: &RawInput) -> Result<Vec<[i32; 4]>, String> {
+    let img = raw_to_image(raw)?;
     engine
         .lock()
         .map_err(|e| e.to_string())?
@@ -728,45 +884,65 @@ impl OcrEngine {
         })
     }
 
-    /// OCR several encoded images, preserving order. A bounded window shares
-    /// recognition workers across pages; detection retains each page's shape.
-    #[pyo3(signature = (images, *, batch_size=4, resize=false, denoise=false, deskew=false, binarize=false))]
+    /// OCR several images (encoded bytes or uint8 numpy arrays), preserving
+    /// order. A bounded window shares recognition workers across pages;
+    /// detection retains each page's shape.
+    #[pyo3(signature = (images, *, batch_size=4, resize=false, denoise=false, deskew=false, binarize=false, colorspace="rgb"))]
     fn ocr_batch<'py>(
         &self,
         py: Python<'py>,
-        images: Vec<PyBackedBytes>,
+        images: Vec<Bound<'py, PyAny>>,
         batch_size: usize,
         resize: bool,
         denoise: bool,
         deskew: bool,
         binarize: bool,
+        colorspace: &str,
     ) -> PyResult<Vec<Bound<'py, PyDict>>> {
         if batch_size == 0 {
             return Err(PyValueError::new_err("batch_size must be positive"));
         }
+        let cs = parse_colorspace(colorspace).map_err(PyValueError::new_err)?;
         let opts = preprocess::PreOpts {
             resize,
             denoise,
             deskew,
             binarize,
         };
+        let raws: Vec<RawInput> = images
+            .iter()
+            .enumerate()
+            .map(|(i, obj)| {
+                extract_input(obj, cs).map_err(|e| PyValueError::new_err(format!("image {i}: {e}")))
+            })
+            .collect::<PyResult<_>>()?;
         let raw = py
-            .allow_threads(|| run_ocr_batch(&self.inner, &images, opts, batch_size))
+            .allow_threads(|| run_ocr_batch(&self.inner, &raws, opts, batch_size))
             .map_err(PyRuntimeError::new_err)?;
         raw.into_iter().map(|r| build_dict(py, r)).collect()
     }
 
-    /// Read pre-cropped line images; `[{"text", "confidence"}]` in input order.
-    #[pyo3(signature = (crops))]
+    /// Read pre-cropped line images (encoded bytes or uint8 numpy arrays);
+    /// `[{"text", "confidence"}]` in input order.
+    #[pyo3(signature = (crops, colorspace="rgb"))]
     fn rec<'py>(
         &self,
         py: Python<'py>,
-        crops: Vec<PyBackedBytes>,
+        crops: Vec<Bound<'py, PyAny>>,
+        colorspace: &str,
     ) -> PyResult<Vec<Bound<'py, PyDict>>> {
-        let raw = py
-            .allow_threads(|| run_rec(&self.inner, &crops))
+        let cs = parse_colorspace(colorspace).map_err(PyValueError::new_err)?;
+        let raws: Vec<RawInput> = crops
+            .iter()
+            .enumerate()
+            .map(|(i, obj)| {
+                extract_input(obj, cs).map_err(|e| PyValueError::new_err(format!("crop {i}: {e}")))
+            })
+            .collect::<PyResult<_>>()?;
+        let out = py
+            .allow_threads(|| run_rec(&self.inner, &raws))
             .map_err(PyRuntimeError::new_err)?;
-        raw.into_iter()
+        out.into_iter()
             .map(|(t, conf)| {
                 let d = PyDict::new(py);
                 d.set_item("text", t)?;
@@ -778,12 +954,19 @@ impl OcrEngine {
 
     /// Find text boxes without reading; needs only the detection model.
     /// Mix model sizes in one engine with det_model_size/rec_model_size.
-    #[pyo3(signature = (image))]
-    fn det<'py>(&self, py: Python<'py>, image: &[u8]) -> PyResult<Vec<Bound<'py, PyDict>>> {
-        let raw = py
-            .allow_threads(|| run_det(&self.inner, image))
+    #[pyo3(signature = (image, colorspace="rgb"))]
+    fn det<'py>(
+        &self,
+        py: Python<'py>,
+        image: &Bound<'py, PyAny>,
+        colorspace: &str,
+    ) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let cs = parse_colorspace(colorspace).map_err(PyValueError::new_err)?;
+        let raw = extract_input(image, cs).map_err(PyValueError::new_err)?;
+        let boxes = py
+            .allow_threads(|| run_det(&self.inner, &raw))
             .map_err(PyRuntimeError::new_err)?;
-        raw.into_iter()
+        boxes.into_iter()
             .map(|b| {
                 let d = PyDict::new(py);
                 d.set_item("topLeftCoord", PyTuple::new(py, [b[0], b[1]])?)?;
@@ -820,31 +1003,37 @@ impl OcrEngine {
         Ok(out)
     }
 
-    /// Run OCR on raw encoded image bytes (jpeg/png/webp/bmp/tiff/gif).
+    /// Run OCR on encoded image bytes (jpeg/png/webp/bmp/tiff/gif) or a uint8
+    /// numpy array (`(H, W, 3)` RGB/BGR, `(H, W)` gray, `(H, W, 4)` RGBA/BGRA).
     ///
     /// Optional preprocessing (applied in this order): ``resize`` (down to
     /// ≤2100×3000), ``denoise`` (fast NLM), ``deskew``, ``binarize`` (Sauvola).
+    /// ``colorspace`` (`"rgb"`/`"bgr"`) applies to 3-channel (and 4-channel)
+    /// arrays; encoded bytes are always decoded as RGB.
     /// Returns ``{"text": str, "structured_text": str, "bounds": {idx: {...}}}``.
-    #[pyo3(signature = (image, resize=false, denoise=false, deskew=false, binarize=false))]
+    #[pyo3(signature = (image, resize=false, denoise=false, deskew=false, binarize=false, colorspace="rgb"))]
     fn ocr<'py>(
         &self,
         py: Python<'py>,
-        image: &[u8],
+        image: &Bound<'py, PyAny>,
         resize: bool,
         denoise: bool,
         deskew: bool,
         binarize: bool,
+        colorspace: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
+        let cs = parse_colorspace(colorspace).map_err(PyValueError::new_err)?;
         let opts = preprocess::PreOpts {
             resize,
             denoise,
             deskew,
             binarize,
         };
-        let raw = py
-            .allow_threads(|| run_ocr(&self.inner, image, opts))
+        let raw = extract_input(image, cs).map_err(PyValueError::new_err)?;
+        let out = py
+            .allow_threads(|| run_ocr(&self.inner, &raw, opts))
             .map_err(PyRuntimeError::new_err)?;
-        build_dict(py, raw)
+        build_dict(py, out)
     }
 
     /// Run OCR on a base64-encoded image string (same payload as the original
@@ -870,32 +1059,44 @@ impl OcrEngine {
             deskew,
             binarize,
         };
-        let raw = py
-            .allow_threads(|| run_ocr(&self.inner, &bytes, opts))
+        let backing = PyBytes::new(py, &bytes);
+        let raw = RawInput::Encoded(
+            backing
+                .extract::<PyBackedBytes>()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        );
+        let out = py
+            .allow_threads(|| run_ocr(&self.inner, &raw, opts))
             .map_err(PyRuntimeError::new_err)?;
-        build_dict(py, raw)
+        build_dict(py, out)
     }
 
     /// Apply the enabled preprocessing steps (resize, denoise, deskew, binarize)
-    /// in one pass and return the prepared image as PNG bytes (this does not run
-    /// OCR). If every option is ``False`` the original bytes are returned
-    /// unchanged.
-    #[pyo3(signature = (image, resize=false, denoise=false, deskew=false, binarize=false))]
+    /// in one pass (this does not run OCR). By default returns the prepared
+    /// image as PNG bytes; with ``return_array=True`` returns a uint8
+    /// ``(H, W, 3)`` numpy array instead (no PNG round-trip before ``ocr``).
+    /// If every option is ``False``, bytes pass through unchanged while arrays
+    /// only convert layouts.
+    #[pyo3(signature = (image, resize=false, denoise=false, deskew=false, binarize=false, colorspace="rgb", return_array=false))]
     fn prepare<'py>(
         &self,
         py: Python<'py>,
-        image: &[u8],
+        image: &Bound<'py, PyAny>,
         resize: bool,
         denoise: bool,
         deskew: bool,
         binarize: bool,
-    ) -> PyResult<Bound<'py, PyBytes>> {
+        colorspace: &str,
+        return_array: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let cs = parse_colorspace(colorspace).map_err(PyValueError::new_err)?;
         let opts = preprocess::PreOpts {
             resize,
             denoise,
             deskew,
             binarize,
         };
+        let raw = extract_input(image, cs).map_err(PyValueError::new_err)?;
         let out = py
             .allow_threads(|| {
                 let workers = self
@@ -904,10 +1105,13 @@ impl OcrEngine {
                     .map_err(|e| e.to_string())?
                     .workers
                     .clone();
-                workers.install(|| prepare_bytes(image, opts))
+                workers.install(|| prepare_raw(&raw, opts, return_array))
             })
             .map_err(PyRuntimeError::new_err)?;
-        Ok(PyBytes::new(py, &out))
+        match out {
+            Prepared::Bytes(bytes) => Ok(PyBytes::new(py, &bytes).into_any()),
+            Prepared::Pixels(img) => Ok(image_to_pyarray(py, &img).into_any()),
+        }
     }
 }
 
@@ -931,17 +1135,19 @@ fn default_engine() -> PyResult<&'static Mutex<Engine>> {
     Ok(DEFAULT_ENGINE.get_or_init(|| Mutex::new(built.0)))
 }
 
-/// OCR multiple images with the shared default engine.
+/// OCR multiple images with the shared default engine. Each image may be
+/// encoded bytes or a uint8 numpy array (see ``OcrEngine.ocr``).
 #[pyfunction]
-#[pyo3(name = "ocr_batch", signature = (images, *, batch_size=4, resize=false, denoise=false, deskew=false, binarize=false))]
+#[pyo3(name = "ocr_batch", signature = (images, *, batch_size=4, resize=false, denoise=false, deskew=false, binarize=false, colorspace="rgb"))]
 fn py_ocr_batch<'py>(
     py: Python<'py>,
-    images: Vec<PyBackedBytes>,
+    images: Vec<Bound<'py, PyAny>>,
     batch_size: usize,
     resize: bool,
     denoise: bool,
     deskew: bool,
     binarize: bool,
+    colorspace: &str,
 ) -> PyResult<Vec<Bound<'py, PyDict>>> {
     if batch_size == 0 {
         return Err(PyValueError::new_err("batch_size must be positive"));
@@ -949,41 +1155,52 @@ fn py_ocr_batch<'py>(
     if images.is_empty() {
         return Ok(Vec::new());
     }
+    let cs = parse_colorspace(colorspace).map_err(PyValueError::new_err)?;
     let opts = preprocess::PreOpts {
         resize,
         denoise,
         deskew,
         binarize,
     };
+    let raws: Vec<RawInput> = images
+        .iter()
+        .enumerate()
+        .map(|(i, obj)| {
+            extract_input(obj, cs).map_err(|e| PyValueError::new_err(format!("image {i}: {e}")))
+        })
+        .collect::<PyResult<_>>()?;
     let engine = py.allow_threads(default_engine)?;
     let raw = py
-        .allow_threads(|| run_ocr_batch(engine, &images, opts, batch_size))
+        .allow_threads(|| run_ocr_batch(engine, &raws, opts, batch_size))
         .map_err(PyRuntimeError::new_err)?;
     raw.into_iter().map(|r| build_dict(py, r)).collect()
 }
 
-/// OCR raw encoded image bytes using a shared default engine.
+/// OCR encoded image bytes or a uint8 numpy array using a shared default engine.
 #[pyfunction]
-#[pyo3(name = "ocr", signature = (image, resize=false, denoise=false, deskew=false, binarize=false))]
+#[pyo3(name = "ocr", signature = (image, resize=false, denoise=false, deskew=false, binarize=false, colorspace="rgb"))]
 fn py_ocr<'py>(
     py: Python<'py>,
-    image: &[u8],
+    image: &Bound<'py, PyAny>,
     resize: bool,
     denoise: bool,
     deskew: bool,
     binarize: bool,
+    colorspace: &str,
 ) -> PyResult<Bound<'py, PyDict>> {
+    let cs = parse_colorspace(colorspace).map_err(PyValueError::new_err)?;
     let opts = preprocess::PreOpts {
         resize,
         denoise,
         deskew,
         binarize,
     };
+    let raw = extract_input(image, cs).map_err(PyValueError::new_err)?;
     let engine = py.allow_threads(default_engine)?;
-    let raw = py
-        .allow_threads(|| run_ocr(engine, image, opts))
+    let out = py
+        .allow_threads(|| run_ocr(engine, &raw, opts))
         .map_err(PyRuntimeError::new_err)?;
-    build_dict(py, raw)
+    build_dict(py, out)
 }
 
 /// OCR a base64-encoded image using a shared default engine.
@@ -1007,34 +1224,48 @@ fn py_ocr_base64<'py>(
         binarize,
     };
     let engine = py.allow_threads(default_engine)?;
-    let raw = py
-        .allow_threads(|| run_ocr(engine, &bytes, opts))
+    let backing = PyBytes::new(py, &bytes);
+    let raw = RawInput::Encoded(
+        backing
+            .extract::<PyBackedBytes>()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    );
+    let out = py
+        .allow_threads(|| run_ocr(engine, &raw, opts))
         .map_err(PyRuntimeError::new_err)?;
-    build_dict(py, raw)
+    build_dict(py, out)
 }
 
-/// Apply the enabled preprocessing steps and return the prepared image as PNG
-/// bytes (no OCR). Returns the original bytes unchanged when no option is set.
+/// Apply the enabled preprocessing steps (no OCR). Returns PNG bytes by
+/// default, or a uint8 ``(H, W, 3)`` numpy array with ``return_array=True``.
+/// Returns the input unchanged when no option is set (bytes stay bytes).
 #[pyfunction]
-#[pyo3(name = "prepare", signature = (image, resize=false, denoise=false, deskew=false, binarize=false))]
+#[pyo3(name = "prepare", signature = (image, resize=false, denoise=false, deskew=false, binarize=false, colorspace="rgb", return_array=false))]
 fn py_prepare<'py>(
     py: Python<'py>,
-    image: &[u8],
+    image: &Bound<'py, PyAny>,
     resize: bool,
     denoise: bool,
     deskew: bool,
     binarize: bool,
-) -> PyResult<Bound<'py, PyBytes>> {
+    colorspace: &str,
+    return_array: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    let cs = parse_colorspace(colorspace).map_err(PyValueError::new_err)?;
     let opts = preprocess::PreOpts {
         resize,
         denoise,
         deskew,
         binarize,
     };
+    let raw = extract_input(image, cs).map_err(PyValueError::new_err)?;
     let out = py
-        .allow_threads(|| prepare_bytes(image, opts))
+        .allow_threads(|| prepare_raw(&raw, opts, return_array))
         .map_err(PyRuntimeError::new_err)?;
-    Ok(PyBytes::new(py, &out))
+    match out {
+        Prepared::Bytes(bytes) => Ok(PyBytes::new(py, &bytes).into_any()),
+        Prepared::Pixels(img) => Ok(image_to_pyarray(py, &img).into_any()),
+    }
 }
 
 #[pymodule]

@@ -24,6 +24,7 @@ bundled-all = ["bundled-tiny", "bundled-small", "bundled-medium"]
 
 [dependencies]
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
+numpy = "0.23"
 # default features minus `tls-native` (which pulls openssl-sys and breaks
 # dependency-free cross-platform wheel builds); use rustls for the model
 # downloader instead.
