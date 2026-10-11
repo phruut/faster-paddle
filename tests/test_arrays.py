@@ -5,6 +5,9 @@ RGBA), array-vs-bytes equality, and error paths.
 """
 import io
 import os
+import subprocess
+import sys
+import textwrap
 
 import numpy as np
 import pytest
@@ -154,3 +157,45 @@ def test_invalid_arrays_and_colorspace():
     with pytest.raises(ValueError, match="crop 0"):
         e.rec([rgb.astype(np.float32)])
     assert e.ocr(_bytes())["bounds"]  # errors must not poison the engine
+
+
+def test_bytes_only_without_numpy():
+    """Bytes inputs must work on a bare install with no numpy.
+
+    pyo3-numpy's array downcasts panic when the numpy capsule is missing, so
+    the sources only probe arrays when numpy is importable; return_array=True
+    raises a clean RuntimeError instead. Runs in a subprocess because the
+    capability check is cached per process.
+    """
+    code = textwrap.dedent(f"""
+        import sys
+
+        class BlockNumpy:
+            def find_spec(self, name, path=None, target=None):
+                if name == "numpy" or name.startswith("numpy."):
+                    raise ModuleNotFoundError("No module named 'numpy'")
+
+        sys.meta_path.insert(0, BlockNumpy())
+        import faster_paddle
+
+        e = faster_paddle.OcrEngine(model_size="tiny", threads=2, model_dir={MODELS_DIR!r})
+        data = open({FIXTURE!r}, "rb").read()
+        r = e.ocr(data)
+        assert r["text"], r
+        try:
+            e.prepare(data, return_array=True)
+        except RuntimeError as err:
+            assert "numpy" in str(err), err
+        else:
+            raise AssertionError("return_array=True should require numpy")
+        print("no-numpy OK")
+    """)
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "no-numpy OK" in out.stdout

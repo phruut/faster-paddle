@@ -448,10 +448,19 @@ enum RawInput {
     Pixels(ImageRgb),
 }
 
+/// Whether the `numpy` module is importable. pyo3-numpy's array downcasts
+/// panic (not error) when the capsule is unavailable, so the array paths must
+/// check first; bytes-only use works on a bare install with no numpy at all.
+/// Cached: availability cannot change after first use in a process.
+fn numpy_available(py: Python<'_>) -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| py.import("numpy").is_ok())
+}
+
 /// Split a `bytes | numpy.ndarray` argument. The ndarray branch is checked
 /// first so buffer-like arrays never fall through to the bytes path.
 fn extract_input(obj: &Bound<'_, PyAny>, colorspace: ColorSpace) -> Result<RawInput, String> {
-    if obj.downcast::<PyUntypedArray>().is_ok() {
+    if numpy_available(obj.py()) && obj.downcast::<PyUntypedArray>().is_ok() {
         return image_from_numpy(obj, colorspace).map(RawInput::Pixels);
     }
     match obj.extract::<PyBackedBytes>() {
@@ -553,13 +562,21 @@ fn raw_to_image(raw: &RawInput) -> Result<ImageRgb, String> {
 }
 
 /// Export an RGB image as a C-contiguous `(H, W, 3)` uint8 array.
-fn image_to_pyarray<'py>(py: Python<'py>, img: &ImageRgb) -> Bound<'py, PyArray<u8, numpy::ndarray::Ix3>> {
+fn image_to_pyarray<'py>(
+    py: Python<'py>,
+    img: &ImageRgb,
+) -> PyResult<Bound<'py, PyArray<u8, numpy::ndarray::Ix3>>> {
+    if !numpy_available(py) {
+        return Err(PyRuntimeError::new_err(
+            "return_array=True requires numpy; install numpy or pass return_array=False",
+        ));
+    }
     let arr = PyArray::<u8, numpy::ndarray::Ix3>::zeros(py, (img.h, img.w, 3), false);
     arr.readwrite()
         .as_slice_mut()
         .expect("fresh C-order array is contiguous")
         .copy_from_slice(&img.data);
-    arr
+    Ok(arr)
 }
 
 /// Encode an RGB image to PNG bytes. If the image is grayscale (all channels
@@ -1429,7 +1446,7 @@ impl OcrEngine {
             .map_err(PyRuntimeError::new_err)?;
         match out {
             Prepared::Bytes(bytes) => Ok(PyBytes::new(py, &bytes).into_any()),
-            Prepared::Pixels(img) => Ok(image_to_pyarray(py, &img).into_any()),
+            Prepared::Pixels(img) => Ok(image_to_pyarray(py, &img)?.into_any()),
         }
     }
 }
@@ -1584,7 +1601,7 @@ fn py_prepare<'py>(
         .map_err(PyRuntimeError::new_err)?;
     match out {
         Prepared::Bytes(bytes) => Ok(PyBytes::new(py, &bytes).into_any()),
-        Prepared::Pixels(img) => Ok(image_to_pyarray(py, &img).into_any()),
+        Prepared::Pixels(img) => Ok(image_to_pyarray(py, &img)?.into_any()),
     }
 }
 
