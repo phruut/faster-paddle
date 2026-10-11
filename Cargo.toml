@@ -9,7 +9,7 @@ repository = "https://github.com/phruut/faster-paddle"
 # (code-only); sizes load from `model_dir`, the local cache, or a one-time
 # download from the GitHub release. Build with `--features bundled-tiny`,
 # `bundled-small`, `bundled-medium`, or `bundled-all` for self-contained wheels.
-include = ["/src/**/*", "/models/**/*", "/build.rs", "/README.md", "/PERFORMANCE_CHANGES.md", "/PERFORMANCE_REVIEW.md", "/PERFORMANCE_NEXT.md", "/benchmarks/**/*.py", "/benchmarks/results/*.jsonl", "/benchmarks/results/*.log", "/pyproject.toml", "/python/**/*.py", "/LICENSE"]
+include = ["/src/**/*", "/models/**/*", "/build.rs", "/README.md", "/docs/**/*.md", "/benchmarks/**/*.py", "/benchmarks/results/*.jsonl", "/benchmarks/results/*.log", "/pyproject.toml", "/python/**/*.py", "/LICENSE"]
 
 [lib]
 name = "faster_paddle"

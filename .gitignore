@@ -9,7 +9,7 @@ __pycache__/
 .venv/
 # local scratch: A/B probes, IR conversions, result logs (never commit)
 /.temp/
-# working notes, superseded by PERFORMANCE_*.md when finalized
+# working notes, superseded by docs/PERFORMANCE_*.md when finalized
 .research/
 # local-only resolver output; the venv is bootstrapped with `uv sync`
 uv.lock

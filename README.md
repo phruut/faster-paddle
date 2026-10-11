@@ -1,36 +1,38 @@
 # faster-paddle
 
-**Fast, CPU-only OCR in Rust with Python bindings** — a self-contained
-reimplementation of PaddleOCR's PP-OCRv6 detection + recognition pipeline
-with [ONNX Runtime](https://onnxruntime.ai/) or
+**Fast, CPU-only OCR in Rust with Python bindings**: a self-contained
+reimplementation of PaddleOCR's PP-OCRv6 detection + recognition pipeline with
+[ONNX Runtime](https://onnxruntime.ai/) or
 [OpenVINO](https://www.intel.com/content/www/us/en/developer/tools/openvino-toolkit/overview.html)
-inference — one runtime per wheel, no Python inference packages.
+inference. One runtime per wheel, no Python inference packages.
 
-- ⚡ CPU latency optimizations: fused image transforms, compact DB components,
+- CPU latency optimizations: fused image transforms, compact DB components,
   dynamic recognition scheduling, and model-specific input widths.
-- 🗂️ **Multi-image OCR** with `ocr_batch`: ordered results and shared recognition
-  work across pages. [See batch usage](#multiple-images).
-- 📦 **Code-only default** — the wheel bundles no model weights. Each size is
-  loaded from `model_dir`, the local cache, or a one-time download from the
-  GitHub release. Build with `--features bundled-tiny/small/medium/all` for a
+- Multi-image OCR with `ocr_batch`: ordered results and shared recognition work
+  across pages. [Batch usage](docs/usage.md#multiple-images).
+- Code-only default: the wheel bundles no model weights. Each size is loaded
+  from `model_dir`, the local cache, or a one-time download from the GitHub
+  release. Build with `--features bundled-tiny/small/medium/all` for a
   self-contained wheel with the weights embedded.
-- 🎚️ **Three model sizes**: `tiny` (default, fastest), `small`, and `medium`
-  (higher accuracy).
-- 🦀 Pure-Rust pre/post-processing (detection DB decode, `minAreaRect`,
+- Three model sizes: `tiny` (default, fastest), `small`, and `medium` (higher
+  accuracy). Split-stage entry points too: boxes only with `det`, recognition
+  only with `rec`, and mixed per-stage sizes
+  (`OcrEngine("tiny", rec_model_size="small")`).
+- Pure-Rust pre/post-processing (detection DB decode, `minAreaRect`,
   perspective crop, CTC decode, reading-order text reconstruction). No OpenCV.
-- 🖥️ Prebuilt wheels for **Linux, Windows, macOS** (x86-64 + arm64).
+- Prebuilt wheels for Linux, Windows, macOS (x86-64 + arm64).
 
-Defaults automatically respect available physical cores, Linux CPU affinity,
-and container CPU limits. Reuse an engine to amortize model/session loading.
-See [performance results and tradeoffs](PERFORMANCE_CHANGES.md) and the
-[benchmark harnesses](benchmarks/) for reproducible measurements.
+Defaults respect available physical cores, Linux CPU affinity, and container
+CPU limits. Reuse an engine to amortize model/session loading. Performance
+results and benchmark harnesses are linked at the
+[bottom](#performance).
 
 ---
 
 ## Install
 
-There are no PyPI releases. Wheels are attached to each GitHub release —
-pick the file matching your platform, then install it directly:
+There are no PyPI releases. Wheels are attached to each GitHub release, so
+pick the file matching your platform and install it directly:
 
 ```bash
 uv pip install https://github.com/phruut/faster-paddle/releases/download/v1.2.1/<wheel-file>
@@ -48,13 +50,11 @@ filenames differ:
 | wheel file | inference | download | pick it when |
 |---|---|---|---|
 | `faster_paddle-1.2.1-...-win_amd64.whl` | ONNX Runtime, linked in | ~9 MB | you want the minimal install |
-| `faster_paddle_openvino-1.2.1-...-win_amd64.whl` | OpenVINO, DLLs bundled | ~20 MB (~65 MB installed) | you want lower latency (see below) |
+| `faster_paddle_openvino-1.2.1-...-win_amd64.whl` | OpenVINO, DLLs bundled | ~20 MB (~65 MB installed) | you want lower latency |
 
 Both are self-contained: no Python `onnxruntime`/`openvino` package, no
-`PATH` setup, no second install. Each wheel carries exactly one inference
-runtime — ONNX Runtime in the default wheel, OpenVINO (and no ONNX Runtime)
-in the OpenVINO wheel. Model weights download on first use either
-way — ONNX weights for `"ort"`, IR weights (`ppocrv6_{size}_{det,rec}.xml`/`.bin`
+`PATH` setup, no second install. Model weights download on first use either
+way: ONNX weights for `"ort"`, IR weights (`ppocrv6_{size}_{det,rec}.xml`/`.bin`
 release assets) for `"ov"`. The backend defaults to the wheel's runtime and
 can be passed explicitly when the build offers more than one:
 
@@ -63,23 +63,23 @@ engine = OcrEngine(model_size="small")                 # ONNX Runtime (default w
 engine = OcrEngine(model_size="small", backend="ov")   # OpenVINO (OpenVINO wheel)
 ```
 
-`"ov"` is 20–70% faster end to end on small/medium (tiny is roughly tied),
-at the cost of minor numeric drift: ~1px box shifts and occasional
-CTC-fragile glyph flips, the same class of difference as ONNX Runtime vs
-PaddlePaddle. Labeled-corpus recall is unchanged. `engine.config["backend"]`
-reports which one is running.
+`"ov"` is 20-70% faster end to end on small/medium (tiny is roughly tied), at
+the cost of minor numeric drift: ~1px box shifts and occasional CTC-fragile
+glyph flips, the same class of difference as ONNX Runtime vs PaddlePaddle.
+Labeled-corpus recall is unchanged. `engine.config["backend"]` reports which
+one is running.
 
-**v1.0.4 upgrades the bundled native ONNX Runtime from 1.24.2 to 1.28.0.**
-This runtime is linked into the Rust extension; no Python `onnxruntime` package
-is required. Inspect it with `faster_paddle.__runtime_build__`.
-See the [full OCR upgrade measurements](PERFORMANCE_CHANGES.md#v104-native-runtime-upgrade).
+The native ONNX Runtime (1.28.0) is statically linked into the Rust
+extension; inspect it with `faster_paddle.__runtime_build__`. See the
+[upgrade measurements](docs/PERFORMANCE_CHANGES.md#v104-native-runtime-upgrade)
+for what that bought.
 
 ## Usage
 
 ```python
 import faster_paddle
 
-# One-shot, using a shared default engine (lazily initialized):
+# one-shot, using a shared default engine (lazily initialized):
 with open("document.jpg", "rb") as f:
     result = faster_paddle.ocr(f.read())
 
@@ -88,7 +88,8 @@ for idx, b in result["bounds"].items():
     print(idx, b["text"], b["confidence"], b["topLeftCoord"], b["bottomRightCoord"])
 ```
 
-Reuse an explicit engine (recommended for servers — load the models once):
+For anything beyond a one-off, construct an engine once and reuse it (this
+amortizes model loading; recommended for servers):
 
 ```python
 from faster_paddle import OcrEngine
@@ -97,128 +98,29 @@ from faster_paddle import OcrEngine
 engine = OcrEngine(model_size="tiny", threads=None, det_max_side=1600)
 
 result = engine.ocr(image_bytes)                 # raw jpeg/png/webp/bmp/tiff/gif bytes
-result = engine.ocr_base64(b64_string)           # base64-encoded image
 result = engine.ocr(np_array)                    # uint8 numpy array, no encode/decode
+result = engine.ocr_base64(b64_string)           # base64-encoded image
+results = engine.ocr_batch(images, batch_size=4) # list in, list out, order preserved
 ```
 
-### Raw pixel input (numpy)
+Every OCR entry point also takes optional preprocessing flags
+(`resize`, `denoise`, `deskew`, `binarize`): they run in fast parallel Rust
+and report boxes back in your original coordinates
+([details](docs/usage.md#optional-preprocessing)).
 
-`ocr`, `ocr_batch`, `det`, `rec`, and `prepare` also accept uint8 numpy
-arrays directly — useful for OpenCV frames, PIL images, and video loops,
-where encoding to PNG/JPG just to decode it again is wasted work:
-
-```python
-import numpy as np
-from PIL import Image
-
-arr = np.asarray(Image.open("document.jpg").convert("RGB"))  # (H, W, 3) RGB
-result = engine.ocr(arr)
-
-bgr = cv2.imread("document.jpg")                 # (H, W, 3) BGR from OpenCV
-result = engine.ocr(bgr, colorspace="bgr")
-
-gray = np.asarray(Image.open("document.jpg").convert("L"))  # (H, W) grayscale
-result = engine.ocr(gray)  # (H, W, 4) RGBA also works; 4-channel uses BGRA order with colorspace="bgr"
-```
-
-Arrays must be `uint8` and C-contiguous (`np.ascontiguousarray` if needed).
-`colorspace="rgb"` (default) or `"bgr"` applies to 3-channel (and 4-channel)
-arrays; encoded bytes are always decoded as RGB. `prepare(..., return_array=True)`
-returns a `(H, W, 3)` array instead of PNG bytes, so `prepare` → `ocr` chains
-stay in pixel space with no codec round-trip.
-
-### Multiple images
-
-Available in **v1.0.2 and later**. Pass a list of encoded image bytes or numpy
-arrays (see Raw pixel input) and get
-one result dictionary per image, in the same order:
-
-```python
-from pathlib import Path
-from faster_paddle import OcrEngine
-
-paths = [Path("page1.png"), Path("page2.jpg"), Path("page3.png")]
-images = [path.read_bytes() for path in paths]
-
-engine = OcrEngine(model_size="small")
-results = engine.ocr_batch(images, batch_size=4)
-for path, result in zip(paths, results):
-    print(path.name, result["text"])
-```
-
-The shared default tiny engine also supports batches:
-
-```python
-import faster_paddle
-
-results = faster_paddle.ocr_batch(images, batch_size=4, resize=True)
-```
-
-`ocr_batch(images, *, batch_size=4, resize=False, denoise=False, deskew=False,
-binarize=False)` processes bounded windows of **images**. It decodes/preprocesses
-in parallel and schedules recognition crops across pages. Each page keeps its
-own detector resolution and coordinate transform. `batch_size` controls the
-number of decoded pages resident in a window; it is independent of `rec_batch`.
-Input bytes are borrowed when possible. An empty list returns `[]`; invalid
-images raise an error with their zero-based input index.
-
-Batching helps fill recognition workers on sparse pages and can improve
-throughput. It is not guaranteed to accelerate dense pages, and the caller waits
-for the complete result list. Use `ocr` for minimum time to the first page's
-result. Minor floating-point confidence differences can occur between the
-single-line and multi-page execution paths.
-
-### Optional preprocessing
-
-`ocr`, `ocr_base64`, and `ocr_batch` take four optional flags (all default `False`), applied —
-when enabled — in the optimal order, all in fast parallel Rust:
-
-```python
-result = engine.ocr(
-    image_bytes,
-    resize=True,     # 1. downscale source to ≤ 2100×3000 (aspect preserved) if larger
-    denoise=True,    # 2. fast Non-Local-Means denoise (grayscale)
-    deskew=True,     # 3. detect skew (Canny + Hough) and rotate to straighten
-    binarize=True,   # 4. Sauvola adaptive thresholding (clean black/white)
-)
-```
-
-Order rationale: resize first (everything downstream is then faster), denoise
-before angle detection and thresholding, deskew on the cleaned image, binarize
-last to produce the final B/W. `resize` can reduce source/crop work, but may add an extra resampling pass when
-detection already hits its size cap; benchmark it on your input. Any of `denoise`/`deskew`/`binarize` converts the
-image to grayscale.
-
-Returned `bounds` are always in the **original image's coordinate space** — even
-when `resize` or `deskew` changes the working image, the boxes are mapped back so
-they line up with your input.
-
-### Preprocess only (no OCR)
-
-`prepare` runs the same preprocessing in one pass and returns the prepared image
-as **PNG bytes** (grayscale once any of denoise/deskew/binarize is on, else
-color). If every option is `False` the original bytes are returned unchanged.
-
-```python
-prepared = engine.prepare(image_bytes, resize=True, denoise=True, deskew=True, binarize=False)
-# or module-level:  faster_paddle.prepare(image_bytes, resize=True, ...)
-
-with open("prepared.png", "wb") as f:
-    f.write(prepared)
-# you can also feed it straight back in:
-result = engine.ocr(prepared)
-```
+Every result carries both `text` and `structured_text`, a layout-preserving
+variant of the text (see [below](#text-vs-structured_text)).
 
 ### Model sizes
 
-| size     | default wheel | det+rec | notes |
-|----------|---------------|---------|-------|
-| `tiny`   | ⬇️ on demand  | ~6 MB   | default, fastest, lightweight |
-| `small`  | ⬇️ on demand  | ~31 MB  | better accuracy |
-| `medium` | ⬇️ on demand  | ~138 MB | best accuracy |
+| size     | det+rec  | notes                |
+|----------|----------|----------------------|
+| `tiny`   | ~6 MB    | default, fastest     |
+| `small`  | ~31 MB   | better accuracy      |
+| `medium` | ~138 MB  | best accuracy        |
 
-A size that isn't bundled in your build is downloaded once on first use (needs
-network that time only) and cached under your user cache dir
+A size that isn't built into your wheel is downloaded once on first use (that
+one time needs network) and cached under your user cache dir
 (`.../faster_paddle/v<VERSION>/{tiny,small,medium}/`). Point the engine at
 local weights to stay fully offline:
 
@@ -230,16 +132,12 @@ engine = OcrEngine(model_size="tiny", model_dir="/path/to/models")
 Layout mirrors this repo: `{model_dir}/{tiny,small,medium}/{det.onnx,rec.onnx}`,
 plus an optional `char_dict.json` per size for custom recognizers. Local files
 beat bundled, cached, and downloaded weights. `engine.config` reports
-`det_source` / `rec_source` (`local`, `bundled`, `cached`, `downloaded`) and the
-resolved `model_dir`.
+`det_source` / `rec_source` (`local`, `bundled`, `cached`, `downloaded`) and
+the resolved `model_dir`.
 
-To embed weights instead of downloading, build from source with cargo features:
-
-```bash
-maturin build --release --features bundled-tiny    # tiny-only (~6 MB of models)
-maturin build --release --features bundled-small   # small-only (~31 MB)
-maturin build --release --features bundled-all     # tiny + small + medium embedded
-```
+To embed weights instead of downloading, build from source with cargo
+features (`bundled-tiny`, `bundled-small`, `bundled-medium`, `bundled-all`;
+see [docs/development.md](docs/development.md#building-from-source)).
 
 ### Result shape
 
@@ -262,190 +160,37 @@ maturin build --release --features bundled-all     # tiny + small + medium embed
 `text` and `bounds` match the JSON contract of the original `paddle-ocr-api`
 service, so it is a drop-in replacement.
 
-### `structured_text`
+### text vs structured_text
 
-A spatial reconstruction that reads **left-to-right, top-to-bottom** while
-preserving the visual layout: vertical whitespace gaps split the page into
-columns/panes (each read fully before the next), and within each one the rows are
-laid out as a monospace grid, so indentation (tree nesting) and aligned
-sub-columns (key/value tables) are kept. Single-glyph UI icon noise is dropped.
+Both are always returned, so pick per use case:
 
-Use **`structured_text`** for screenshots, forms, table/tree UIs, and code —
-anything where spatial structure carries meaning. Use **`text`** for dense
-multi-column prose: there the absolute pixel spacing of `structured_text`
-produces very wide lines, so the column-merging `text` reconstruction reads
-better. Both are always returned, so you can pick per use case.
+- `structured_text` reads left-to-right, top-to-bottom while keeping the visual
+  layout: whitespace gaps split the page into columns/panes, and rows inside
+  each pane keep their indentation and aligned sub-columns. Use it for
+  screenshots, forms, table/tree UIs, and code.
+- `text` merges columns into plain reading-order lines. Use it for dense
+  multi-column prose, where `structured_text`'s pixel-accurate spacing
+  produces very wide lines.
 
-Example `structured_text` for a two-pane file-tree + settings UI:
-
-```
-Project
- src (14)
-   main.rs
-   parser.rs
-   utils.rs
- tests
- docs
-
-Setting                                            Value
-        max_connections                            128
-        request_timeout_seconds                    30
-        cache_size_mb                              512
-```
-
-## API
-
-| | |
-|---|---|
-| `faster_paddle.ocr(image, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb") -> dict` | OCR encoded image bytes or a uint8 numpy array (shared default engine). |
-| `faster_paddle.ocr_batch(images, *, batch_size=4, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb") -> list[dict]` | OCR multiple encoded images/arrays; results preserve input order. |
-| `faster_paddle.ocr_base64(image_base64, resize=False, denoise=False, deskew=False, binarize=False) -> dict` | OCR a base64 image string. |
-| `OcrEngine(model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_model_size=None, rec_model_size=None, model_dir=None, det_min_side=None, rec_min_width=None, backend=None)` | Construct a reusable engine (`backend`: `"ort"` or `"ov"`; defaults to the wheel's compiled runtime). |
-| `OcrEngine.ocr(image, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb") -> dict` | OCR encoded image bytes or a uint8 numpy array. |
-| `OcrEngine.ocr_batch(images, *, batch_size=4, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb") -> list[dict]` | OCR multiple encoded images/arrays; results preserve input order. |
-| `OcrEngine.rec(crops, colorspace="rgb") -> list[{"text": str, "confidence": float}]` | Recognize pre-cropped line images (bytes or arrays), skipping detection; input order preserved. |
-| `OcrEngine.det(image, colorspace="rgb") -> list[{"topLeftCoord": (x1, y1), "bottomRightCoord": (x2, y2)}]` | Detect text boxes without recognizing; needs only the detection model. |
-| `OcrEngine.ocr_base64(image_base64, resize=False, denoise=False, deskew=False, binarize=False) -> dict` | OCR a base64 image string. |
-| `faster_paddle.prepare(image, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb", return_array=False) -> bytes` | Preprocess only; PNG bytes by default, `(H, W, 3)` numpy array with `return_array=True` (no OCR). |
-| `OcrEngine.prepare(image, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb", return_array=False) -> bytes` | Preprocess only; PNG bytes by default, `(H, W, 3)` numpy array with `return_array=True` (no OCR). |
-
-- `image`/`images`/`crops`: encoded `bytes` (jpeg/png/webp/bmp/tiff/gif) or a
-  C-contiguous `uint8` numpy array — `(H, W, 3)` RGB/BGR, `(H, W)` gray, or
-  `(H, W, 4)` RGBA/BGRA (see Raw pixel input).
-
-- `resize`/`denoise`/`deskew`/`binarize`: optional preprocessing (see above).
-- `model_size`: `"tiny"` (default), `"small"`, or `"medium"`.
-- `det_model_size`/`rec_model_size`: per-stage model size, defaulting to
-  `model_size`. Mixing sizes (e.g. `OcrEngine("tiny", rec_model_size="small")`)
-  loads a fast detector with a more accurate recognizer in one engine.
-- `model_dir`: directory with local weights (see Model sizes), defaulting to
-  `FASTER_PADDLE_MODEL_DIR`. Each needed size falls back to bundled weights
-  (if built in), then cache, then a one-time download.
-- `threads`: total CPU budget; defaults to available physical cores, limited by
-  affinity and OS/container quotas. An explicit positive value overrides discovery.
-- `batch_size`: maximum decoded images per batch window (default **4**, must be positive).
-- `rec_batch`: **actual maximum** crops per recognition tensor (default **1**).
-  Independent crops share the worker pool. Larger caps are available for tuning.
-- `det_max_side`: detector long-side limit (default **1600**); recognition crops
-  still come from the original source. Lower values can miss small text.
-- `det_min_side`: minimum detector short side (default **736**). Set **0** to
-  disable minimum-side upscaling. Dimensions are still rounded to multiples of 32.
-- `rec_min_width`: recognition padding floor, automatically **64 for tiny**, **96
-  for small**, and **320 for medium**. Set **320** for the reference padding
-  behavior. Shorter padding changes context and can change text/confidence;
-  validate your languages and documents when migrating.
-- `backend`: `"ort"` or `"ov"`; defaults to the wheel's runtime (`"ort"` in the
-  default wheel, `"ov"` in the OpenVINO wheel). Passing the backend the wheel
-  wasn't built with raises a clear error. `"ov"` reads IR weights and always
-  uses singleton `rec_batch`.
-- `engine.config`: dictionary of resolved thread counts, pool size and input
-  limits, for diagnostics and reproducible benchmarks. `faster_paddle.__backends__`
-  lists the compiled runtimes and `faster_paddle.__runtime_build__` the linked
-  runtime version.
-
-Calls release the GIL. Inference on a shared engine is serialized; decode and
-layout can overlap. Independent engines have independent CPU budgets, so set
-`threads` explicitly when running several engines concurrently.
-
-### Parallelism
-
-- The detector uses up to **8** threads within the CPU budget.
-- Recognition uses up to one worker per available physical core, capped at 32
-  (8 for medium) to limit model memory. Jobs are scheduled dynamically, largest
-  estimated jobs first. Sparse long-line jobs use a separate pool of up to four sessions with up to
-  four threads each, within the same CPU budget. Session construction is parallel
-  in bounded groups to reduce startup latency.
-- An engine-local Rayon pool handles image and geometry work within the same
-  CPU budget. ONNX workers spin during inference to reduce wakeup latency, and stop
-  spinning immediately when their inference call finishes.
-- Input tensor buffers are reused. Recognition budgets include actual padding.
-
-Advanced overrides (read at engine construction): `OCR_THREADS`,
-`OCR_DET_THREADS`, `REC_POOL`, `REC_BUDGET`, `RAYON_NUM_THREADS`, `OCR_REC_MIN_WIDTH`,
-`OCR_DET_MIN_SIDE`, `OCR_MEMPAT`, `OCR_PREPACK`, `OCR_DET_SPIN`, `OCR_REC_SPIN`,
-`OCR_APPROX_GELU`. Approximate GELU stays off: its measured end-to-end benefit
-was inconsistent and it changed a detection.
-Constructor arguments take precedence over their corresponding environment
-values; detector/worker/Rayon counts are capped by the total CPU budget.
-The CPU-count defaults are measured heuristics, not online autotuning; benchmark
-other CPU architectures with `benchmarks/cpu_latency.py` before overriding them.
+A worked example is in [docs/usage.md](docs/usage.md#structured_text).
 
 ---
 
-## How it works
+## Performance
 
-The pipeline faithfully mirrors PaddleOCR's lightweight path:
+- The [performance changelog](docs/PERFORMANCE_CHANGES.md) records what was
+  measured and changed (runtime upgrade, scheduling, memory).
+- Reproducible harnesses live in `benchmarks/` (`cpu_latency.py`,
+  `batch_latency.py`, graph and memory probes).
 
-1. **Detection** — resize (min-side 736, cap the longer side at `det_max_side`
-   = 1600 by default vs PaddleOCR's 4000, round to ×32), normalize (BGR mean/std),
-   run the DB detector. Lower detector resolution reduces work but can miss small text; recognition
-   still crops from the full-res image.
-2. **DB post-process** — threshold 0.2, connected components, `minAreaRect`,
-   box score ≥ 0.4, `unclip` ratio 1.4, rescale to source coordinates.
-3. **Sort** boxes top-to-bottom / left-to-right; **crop** each via perspective warp.
-4. **Recognition** — resize each crop to H=48, normalize, batch, run the CTC
-   recognizer (6,906 output classes for tiny, 18,710 for small), greedy CTC decode.
-5. **Reconstruct** reading-order text with dynamic column/line detection.
+## Docs
 
-Detection matches PaddlePaddle at **96 % IoU>0.5** with **0.93 character-level
-similarity** on the recognized text; the residual difference is ONNX-Runtime vs
-PaddlePaddle floating-point numerics, not the algorithm.
-
-The bundled tiny and small PP-OCRv6 models were exported with `paddle2onnx`.
-
-## Building from source
-
-```bash
-pip install maturin
-maturin develop --release      # build + install into the current environment
-# or
-maturin build --release        # produce a wheel in target/wheels/
-```
-
-Add `--features bundled-tiny`, `bundled-small`, `bundled-medium`, or
-`bundled-all` to embed weights (default wheel bundles nothing; see Model
-sizes).
-
-Requires a Rust toolchain. ONNX Runtime is fetched automatically by the `ort`
-crate at build time and bundled into the wheel (statically linked into the
-extension on Windows).
-
-To build the OpenVINO wheel instead (`faster-paddle-openvino`, `backend="ov"`),
-rename the distribution and enable the feature with the native libs available.
-`--no-default-features` drops the `ort-backend` default so this wheel ships
-OpenVINO only:
-
-```bash
-# one-time: pip install "openvino==2026.4.1" libclang  (pins in CI: OV_VERSION)
-# then point the build at its libs (here: the pip layout):
-#   $env:OV_LIB_DIR='<python>/Lib/site-packages/openvino/libs'
-sed -i 's/^name = "faster-paddle"$/name = "faster-paddle-openvino"/' pyproject.toml
-maturin build --release --no-default-features --features openvino-backend
-```
-(Windows dev shells: same rename via any string replace; CI uses bash on all
-platforms, so the `sed` line works there verbatim.)
-
-`build.rs` vendors the CPU-only OpenVINO runtime into the wheel, so the
-result installs anywhere with no extra setup. IR weights are converted from
-the `.onnx` files with the same pinned OpenVINO (`ov.convert_model` +
-`ov.save_model`) and resolve from `OV_IR_DIR`/`model_dir`, cache, or release
-download — see Install. Enabling both `ort-backend` and `openvino-backend`
-is possible for local A/B builds; released wheels carry exactly one runtime.
-
-## Tests
-
-```bash
-cargo test --release                 # Rust unit tests (geometry, resize, CTC)
-maturin develop --release            # then the Python integration tests:
-python -m pytest tests -q
-```
-
-The tests cover geometry equivalence, fused resize/padding, recognition caps,
-known text, both small models, batch ordering and transforms, buffer reuse,
-concurrent calls, error recovery, CPU affinity/budgets, and preprocessing. CI
-runs Rust and Python tests before publishing. Install `pytest`, `pillow`, and
-`numpy` for the Python suite. Performance comparisons live under `benchmarks/`; the
-small bundled test corpus is not a comprehensive OCR accuracy benchmark.
+| file | contents |
+|---|---|
+| [docs/api.md](docs/api.md) | full function reference, constructor args, env overrides, parallelism |
+| [docs/usage.md](docs/usage.md) | numpy input, batching, preprocessing, `prepare`, `structured_text` |
+| [docs/development.md](docs/development.md) | pipeline internals, building from source, tests |
+| [docs/PERFORMANCE_CHANGES.md](docs/PERFORMANCE_CHANGES.md) | measured changes and their evidence |
 
 ## License
 
