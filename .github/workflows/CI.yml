@@ -242,3 +242,24 @@ jobs:
           assert (cfg['det_source'], cfg['rec_source']) == ('downloaded', 'downloaded'), cfg
           print('download OK:', cfg['det_model_size'], cfg['det_source'], cfg['rec_source'])
           "
+
+  # Tag-only: attach the prebuilt wheels (+ sdist) to the GitHub release so
+  # consumers can install without Rust/MSVC, e.g.
+  #   uv pip install https://github.com/phruut/faster-paddle/releases/download/v1.1.1/<wheel-file>
+  # Gated on download-check so the two softprops/action-gh-release writers
+  # (model-assets, then this) never race each other on the same tag.
+  release:
+    name: Attach wheels to release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [tests, linux, windows, macos, sdist, download-check]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
