@@ -1,15 +1,15 @@
 [package]
 name = "faster_paddle"
-version = "1.1.2"
+version = "1.2.0"
 edition = "2021"
 license = "MIT"
-description = "Fast CPU OCR (PaddleOCR PP-OCRv6 tiny/small/medium) with Python bindings, powered by ONNX Runtime."
+description = "Fast CPU OCR (PaddleOCR PP-OCRv6 tiny/small/medium) with Python bindings, powered by ONNX Runtime or OpenVINO."
 repository = "https://github.com/phruut/faster-paddle"
 # Models are optional at build time. The default wheel bundles nothing
 # (code-only); sizes load from `model_dir`, the local cache, or a one-time
 # download from the GitHub release. Build with `--features bundled-tiny`,
 # `bundled-small`, `bundled-medium`, or `bundled-all` for self-contained wheels.
-include = ["/src/**/*", "/models/**/*", "/build.rs", "/README.md", "/PERFORMANCE_CHANGES.md", "/PERFORMANCE_REVIEW.md", "/PERFORMANCE_NEXT.md", "/benchmarks/**/*.py", "/benchmarks/results/*.jsonl", "/benchmarks/results/*.log", "/pyproject.toml", "/LICENSE"]
+include = ["/src/**/*", "/models/**/*", "/build.rs", "/README.md", "/PERFORMANCE_CHANGES.md", "/PERFORMANCE_REVIEW.md", "/PERFORMANCE_NEXT.md", "/benchmarks/**/*.py", "/benchmarks/results/*.jsonl", "/benchmarks/results/*.log", "/pyproject.toml", "/python/**/*.py", "/LICENSE"]
 
 [lib]
 name = "faster_paddle"
@@ -21,6 +21,10 @@ bundled-tiny = []
 bundled-small = []
 bundled-medium = []
 bundled-all = ["bundled-tiny", "bundled-small", "bundled-medium"]
+# Opt-in OpenVINO inference backend (parallel to the default ONNX Runtime
+# backend). Requires OpenVINO native libs at build time (see src/ov_backend.rs);
+# default builds never compile it.
+openvino-backend = ["dep:openvino", "dep:openvino-sys"]
 
 [dependencies]
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
@@ -47,6 +51,12 @@ serde_json = "1"
 # runtime download of sizes that aren't bundled; rustls to stay openssl-free
 ureq = { version = "2", default-features = false, features = ["tls"] }
 dirs = "5"
+# see `openvino-backend` feature above; opt-in only
+openvino = { version = "0.11", optional = true }
+# `openvino-sys` is a transitive dep of `openvino`, but src/ov_backend.rs also
+# calls `ov_core_set_property` directly (see set_core_property) because the
+# crate's binding declares the variadic C function with fixed arguments.
+openvino-sys = { version = "0.11", optional = true }
 
 [profile.release]
 opt-level = 3

@@ -1,11 +1,11 @@
 [build-system]
-requires = ["maturin>=1.7,<2.0"]
+requires = ["maturin>=1.12.1,<2.0"]
 build-backend = "maturin"
 
 [project]
 name = "faster-paddle"
-version = "1.1.2"
-description = "Fast CPU OCR — PaddleOCR PP-OCRv6 tiny/small/medium in Rust + ONNX Runtime, with hardware-aware scheduling and multi-image recognition."
+version = "1.2.0"
+description = "Fast CPU OCR — PaddleOCR PP-OCRv6 tiny/small/medium in Rust, with ONNX Runtime or OpenVINO inference, hardware-aware scheduling and multi-image recognition."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -28,8 +28,14 @@ Repository = "https://github.com/phruut/faster-paddle"
 
 [tool.maturin]
 module-name = "faster_paddle"
+python-source = "python"
 features = ["pyo3/extension-module"]
 strip = true
+# OpenVINO wheel (`--features openvino-backend`): build.rs stages the vendored
+# CPU runtime flat into $OUT_DIR, and this include drops it into the package
+# beside the extension (flat: plugin discovery resolves relative to
+# plugins.xml). Matches nothing for default builds.
+include = [{ path = "*", from = "out-dir", to = "faster_paddle/" }]
 # Bundled model bytes (if any, via `--features bundled-*`) live in the
 # extension. Cargo.toml includes the source assets in sdists; duplicating
 # them as wheel data would inflate downloads.

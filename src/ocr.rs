@@ -14,17 +14,17 @@ pub const DET_THRESH: f32 = 0.2;
 pub const DET_UNCLIP_RATIO: f64 = 1.4;
 pub const DET_MAX_CANDIDATES: usize = 3000;
 pub const TEXT_SCORE: f32 = 0.0;
-const DET_MIN_SIZE: f64 = 3.0;
-const LIMIT_SIDE_LEN: i64 = 736;
-const MAX_SIDE_LIMIT: i64 = 4000;
+pub(crate) const DET_MIN_SIZE: f64 = 3.0;
+pub(crate) const LIMIT_SIDE_LEN: i64 = 736;
+pub(crate) const MAX_SIDE_LIMIT: i64 = 4000;
 /// Detector long-side cap. Lowering it saves compute but can miss small text;
 /// recognition still uses full-resolution source crops.
 pub const DEFAULT_DET_MAX_SIDE: i64 = 1600;
-const DET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
-const DET_STD: [f32; 3] = [0.229, 0.224, 0.225];
+pub(crate) const DET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+pub(crate) const DET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
-const REC_H: usize = 48;
-const REC_MAX_W: usize = 3200;
+pub(crate) const REC_H: usize = 48;
+pub(crate) const REC_MAX_W: usize = 3200;
 // Singleton crops minimize measured CPU latency; the worker pool supplies
 // parallelism. The public override is a real cap, not a multiplier.
 pub const DEFAULT_REC_BATCH: usize = 1;
@@ -609,7 +609,7 @@ fn rec_batch_run(
     Ok(res)
 }
 
-fn ctc_decode(chars: &[String], logits: &[f32], t: usize, cls: usize) -> (String, f32) {
+pub(crate) fn ctc_decode(chars: &[String], logits: &[f32], t: usize, cls: usize) -> (String, f32) {
     let mut last = usize::MAX;
     let mut s = String::new();
     let mut sum = 0.0f64;
@@ -652,7 +652,7 @@ fn ctc_decode(chars: &[String], logits: &[f32], t: usize, cls: usize) -> (String
 /// so that `batch_len * max_rec_width_in_batch <= budget` (a padding-compute
 /// budget), with a hard `max_count` per batch. Narrow crops batch many together;
 /// wide line-crops end up nearly alone.
-fn plan_rec_batches(
+pub(crate) fn plan_rec_batches(
     order: &[usize],
     rec_widths: &[usize],
     budget: usize,
@@ -678,7 +678,7 @@ fn plan_rec_batches(
 }
 
 // Preserve the runner's historical floor rounding; planning and allocation must agree.
-fn rec_width(w: usize, h: usize, min_width: usize) -> usize {
+pub(crate) fn rec_width(w: usize, h: usize, min_width: usize) -> usize {
     ((REC_H as f64 * w as f64 / h as f64) as usize).clamp(min_width, REC_MAX_W)
 }
 
@@ -687,7 +687,7 @@ fn det_resize_dims(w: usize, h: usize, max_side: i64) -> (usize, usize) {
     det_resize_dims_with_min(w, h, max_side, LIMIT_SIDE_LEN)
 }
 
-fn det_resize_dims_with_min(w: usize, h: usize, max_side: i64, min_side: i64) -> (usize, usize) {
+pub(crate) fn det_resize_dims_with_min(w: usize, h: usize, max_side: i64, min_side: i64) -> (usize, usize) {
     let (h, w) = (h as i64, w as i64);
     // A zero minimum disables the minimum-side upscale.
 
@@ -711,7 +711,7 @@ fn det_resize_dims_with_min(w: usize, h: usize, max_side: i64, min_side: i64) ->
 
 /// Fuse byte-exact bilinear resize, BGR planar conversion and normalization.
 /// Padding is reset on every use so reused buffers never leak a previous crop.
-fn resize_to_tensor(
+pub(crate) fn resize_to_tensor(
     src: &ImageRgb,
     dw: usize,
     dh: usize,
@@ -903,7 +903,7 @@ fn dilate_2x2(fg: &[u8], w: usize, h: usize) -> Vec<u8> {
 
 /// DB post-process. Returns quad boxes in source-image coordinates.
 #[allow(clippy::too_many_arguments)]
-fn db_postprocess(
+pub(crate) fn db_postprocess(
     pred: &[f32],
     pw: usize,
     ph: usize,
@@ -959,7 +959,7 @@ fn db_postprocess(
 }
 
 /// Replicates SortQuadBoxes: top-to-bottom, left-to-right.
-fn sort_boxes(mut boxes: Vec<[cv::Pt; 4]>) -> Vec<[cv::Pt; 4]> {
+pub(crate) fn sort_boxes(mut boxes: Vec<[cv::Pt; 4]>) -> Vec<[cv::Pt; 4]> {
     boxes.sort_by(|a, b| {
         a[0].1
             .partial_cmp(&b[0].1)
@@ -985,7 +985,7 @@ fn sort_boxes(mut boxes: Vec<[cv::Pt; 4]>) -> Vec<[cv::Pt; 4]> {
 }
 
 /// Axis-aligned bounding box of a quad, in source-image coordinates.
-fn quad_to_box4(q: &[cv::Pt; 4]) -> [i32; 4] {
+pub(crate) fn quad_to_box4(q: &[cv::Pt; 4]) -> [i32; 4] {
     let left = q.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
     let right = q.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
     let top = q.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
@@ -994,7 +994,7 @@ fn quad_to_box4(q: &[cv::Pt; 4]) -> [i32; 4] {
 }
 
 /// get_minarea_rect_crop + get_rotate_crop_image.
-fn crop_quad(img: &ImageRgb, quad: &[cv::Pt; 4]) -> Option<ImageRgb> {
+pub(crate) fn crop_quad(img: &ImageRgb, quad: &[cv::Pt; 4]) -> Option<ImageRgb> {
     // get_minarea_rect_crop: minAreaRect of the (already rectangular) quad, then order points.
     let (rect, _side) = cv::min_area_rect(quad);
     // order points like get_minarea_rect_crop: sort by x, pick a/b/c/d

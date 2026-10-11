@@ -16,6 +16,12 @@ concurrency:
 permissions:
   contents: read
 
+# OpenVINO build/test pin. The Rust bindings accept any recent 2026.x, but
+# the shipped IR weights and the wheel DLLs must come from ONE version, so
+# every OV job and the IR conversion below use exactly this.
+env:
+  OV_VERSION: "2026.4.1"
+
 jobs:
   tests:
     runs-on: ubuntu-latest
@@ -91,6 +97,87 @@ jobs:
           name: wheels-linux-${{ matrix.target }}
           path: dist
 
+  # OpenVINO wheel (x86_64 only). There is no PyPI openvino wheel for
+  # linux-aarch64, so the ARM64 OV libs have no pip source; the ORT wheel
+  # remains the ARM story (an official-archive route is a possible follow-up).
+  # The OV DLLs/.so's are vendored INTO this wheel by build.rs, and the wheel
+  # ships under the faster-paddle-openvino distribution name so both wheels
+  # coexist as release assets.
+  linux-ov:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Host pip packages are for IR conversion + wheel tests only. The wheel
+      # BUILD runs inside the manylinux container, so its own OV/libclang come
+      # from the container-local pip in before-script-linux below.
+      - run: python -m pip install pytest pillow numpy "openvino==${{ env.OV_VERSION }}"
+      - name: Rename distribution for the OV wheel
+        shell: bash
+        run: |
+          sed -i.bak 's/^name = "faster-paddle"$/name = "faster-paddle-openvino"/' pyproject.toml
+          rm -f pyproject.toml.bak
+          grep '^name = ' pyproject.toml
+      - name: Build OV wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          # --auditwheel skip: the OV runtime is vendored manually beside the
+          # extension (RPATH $ORIGIN) with plugins.xml + plugin adjacent.
+          # Repair would relocate the linked libs into .libs/ (hashed names),
+          # stranding plugins.xml/the dlopen'd CPU plugin, which it can't see.
+          args: --release --locked --features openvino-backend --auditwheel skip --out dist
+          sccache: "true"
+          manylinux: "2_34"
+          before-script-linux: |
+            # The manylinux container's default `pip`/`python` predates
+            # openvino>=2026 (PyPI needs >=3.10), so use the container's
+            # cp311 interpreter explicitly (matches the runner's 3.11).
+            PYBIN=/opt/python/cp311-cp311/bin/python
+            if [ ! -x "$PYBIN" ]; then PYBIN=$(ls -d /opt/python/cp311*/bin/python 2>/dev/null | head -n 1); fi
+            "$PYBIN" -m pip install "openvino==${{ env.OV_VERSION }}" libclang
+            export OV_LIB_DIR=$("$PYBIN" -c "import sysconfig, os; print(os.path.join(sysconfig.get_paths()['purelib'], 'openvino', 'libs'))")
+            export LIBCLANG_PATH=$("$PYBIN" -c "import sysconfig, os; print(os.path.join(sysconfig.get_paths()['purelib'], 'clang', 'native'))")
+            ls "$OV_LIB_DIR" "$LIBCLANG_PATH"
+            # openvino-sys links `libopenvino.so` / `libopenvino_c.so` by exact
+            # name, but the pip wheel ships only versioned files
+            # (`libopenvino.so.2641`); symlink them so the finder resolves.
+            # SONAMEs stay versioned, so the vendored versioned libs still
+            # satisfy the runtime loader via rpath ($ORIGIN).
+            ln -sf "$(ls "$OV_LIB_DIR"/libopenvino.so.* | head -n 1)" "$OV_LIB_DIR/libopenvino.so"
+            ln -sf "$(ls "$OV_LIB_DIR"/libopenvino_c.so.* | head -n 1)" "$OV_LIB_DIR/libopenvino_c.so"
+            ls -la "$OV_LIB_DIR"/libopenvino*.so* "$OV_LIB_DIR"/libopenvino_c*.so*
+            export LD_LIBRARY_PATH="$OV_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export ORT_CXX_STDLIB=
+      # Convert tiny+small to IR on the fly and run the FULL suite: default
+      # backend against models/, OV tests against the converted IR. Medium is
+      # covered by the local A/B, not CI (conversion cost).
+      - name: Test installed OV wheel (both backends)
+        shell: bash
+        env:
+          OCR_THREADS: "2"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          FASTER_PADDLE_MODEL_DIR: ${{ github.workspace }}/models
+          OV_IR_DIR: ${{ runner.temp }}/ir-test
+        run: |
+          python scripts/convert_ir.py "$OV_IR_DIR" tiny small
+          python -m pip install dist/*.whl
+          echo "--- wheel contents (vendored runtime proof) ---"
+          unzip -l dist/*.whl | head -n 40 || true
+          if ! python -m pytest tests -q > wheel-tests.log 2>&1; then
+            cat wheel-tests.log
+            python -c "from pathlib import Path; print('::error::' + Path('wheel-tests.log').read_text().replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'))"
+            exit 1
+          fi
+          cat wheel-tests.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-ov-linux-x86_64
+          path: dist
+
   windows:
     runs-on: windows-latest
     strategy:
@@ -128,6 +215,68 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-windows-${{ matrix.target }}
+          path: dist
+
+  # Windows OpenVINO wheel. Native deps come from pinned pip packages
+  # (openvino for the runtime, libclang for bindgen); the wheel itself stays
+  # self-contained via build.rs vendoring. Ships as faster-paddle-openvino.
+  windows-ov:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        target: [x64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: ${{ matrix.target }}
+      - run: python -m pip install pytest pillow numpy "openvino==${{ env.OV_VERSION }}" libclang
+      - name: Locate native deps
+        shell: bash
+        run: |
+          OV_DIR=$(python -c "import sysconfig, os; print(os.path.join(sysconfig.get_paths()['purelib'], 'openvino', 'libs'))")
+          CLANG_DIR=$(python -c "import sysconfig, os; print(os.path.join(sysconfig.get_paths()['purelib'], 'clang', 'native'))")
+          echo "OV_LIB_DIR=$OV_DIR" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$CLANG_DIR" >> "$GITHUB_ENV"
+          # openvino-sys locates openvino.lib / openvino_c.lib via PATH on
+          # Windows; build.rs vendoring uses OV_LIB_DIR.
+          echo "$OV_DIR" >> "$GITHUB_PATH"
+          ls "$OV_DIR"
+      - name: Rename distribution for the OV wheel
+        shell: bash
+        run: |
+          sed -i.bak 's/^name = "faster-paddle"$/name = "faster-paddle-openvino"/' pyproject.toml
+          rm -f pyproject.toml.bak
+          grep '^name = ' pyproject.toml
+      - name: Build OV wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --locked --features openvino-backend --out dist
+          sccache: "true"
+      - name: Test installed OV wheel (both backends)
+        shell: bash
+        env:
+          OCR_THREADS: "2"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          FASTER_PADDLE_MODEL_DIR: ${{ github.workspace }}/models
+          OV_IR_DIR: ${{ runner.temp }}/ir-test
+        run: |
+          python scripts/convert_ir.py "$OV_IR_DIR" tiny small
+          python -m pip install dist/*.whl
+          echo "--- wheel contents (vendored runtime proof) ---"
+          unzip -l dist/*.whl | head -n 40 || true
+          if ! python -m pytest tests -q > wheel-tests.log 2>&1; then
+            cat wheel-tests.log
+            python -c "from pathlib import Path; print('::error::' + Path('wheel-tests.log').read_text().replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'))"
+            exit 1
+          fi
+          cat wheel-tests.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-ov-windows-${{ matrix.target }}
           path: dist
 
   macos:
@@ -170,6 +319,106 @@ jobs:
           name: wheels-macos-${{ matrix.target }}
           path: dist
 
+  # macOS (Apple Silicon) OpenVINO wheel. CPU-only on macOS, same shape as the
+  # other OV jobs: pinned pip runtime, vendored dylibs, faster-paddle-openvino
+  # distribution name. Linux/macOS .so/.dylib names in build.rs are verified
+  # against the pinned pip layout; this job is the release gate for them.
+  macos-ov:
+    runs-on: macos-14      # apple silicon
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        target: [aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install pytest pillow numpy "openvino==${{ env.OV_VERSION }}" libclang
+      - name: Locate native deps
+        shell: bash
+        run: |
+          OV_DIR=$(python -c "import sysconfig, os; print(os.path.join(sysconfig.get_paths()['purelib'], 'openvino', 'libs'))")
+          CLANG_DIR=$(python -c "import sysconfig, os; print(os.path.join(sysconfig.get_paths()['purelib'], 'clang', 'native'))")
+          echo "OV_LIB_DIR=$OV_DIR" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$CLANG_DIR" >> "$GITHUB_ENV"
+          # openvino-sys links `libopenvino.dylib` / `libopenvino_c.dylib` by
+          # exact name, but the pip wheel ships only versioned files
+          # (`libopenvino.2641.dylib`); symlink them so the finder (which
+          # probes DYLD_LIBRARY_PATH on macOS) resolves. Install names stay
+          # versioned, so the vendored versioned dylibs still satisfy the
+          # loader via @loader_path rpath.
+          ln -sf "$(ls "$OV_DIR"/libopenvino.[0-9]*.dylib | head -n 1)" "$OV_DIR/libopenvino.dylib"
+          ln -sf "$(ls "$OV_DIR"/libopenvino_c.[0-9]*.dylib | head -n 1)" "$OV_DIR/libopenvino_c.dylib"
+          echo "DYLD_LIBRARY_PATH=$OV_DIR${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          ls -la "$OV_DIR"
+      - name: Rename distribution for the OV wheel
+        shell: bash
+        run: |
+          sed -i.bak 's/^name = "faster-paddle"$/name = "faster-paddle-openvino"/' pyproject.toml
+          rm -f pyproject.toml.bak
+          grep '^name = ' pyproject.toml
+      - name: Build OV wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --locked --features openvino-backend --out dist
+          sccache: "true"
+      - name: Test installed OV wheel (both backends)
+        shell: bash
+        env:
+          OCR_THREADS: "2"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          FASTER_PADDLE_MODEL_DIR: ${{ github.workspace }}/models
+          OV_IR_DIR: ${{ runner.temp }}/ir-test
+        run: |
+          # GITHUB_ENV carried DYLD_LIBRARY_PATH here from "Locate native
+          # deps" (needed only by the build's openvino-finder probe). Drop it:
+          # the wheel vendors its own runtime, and dropping it rules out
+          # host-lib bleed if a vendored rpath ever regresses.
+          unset DYLD_LIBRARY_PATH
+          python scripts/convert_ir.py "$OV_IR_DIR" tiny small
+          python -m pip install dist/*.whl
+          echo "--- wheel contents (vendored runtime proof) ---"
+          unzip -l dist/*.whl | head -n 40 || true
+          if ! python -m pytest tests -q > wheel-tests.log 2>&1; then
+            cat wheel-tests.log
+            python -c "from pathlib import Path; print('::error::' + Path('wheel-tests.log').read_text().replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'))"
+            exit 1
+          fi
+          cat wheel-tests.log
+      # A native segfault leaves almost no signal in the pytest log. Dump the
+      # wheel layout, the vendored dylibs' rpaths, and the macOS crash report
+      # (which holds the native crashing frame) so the next failure is actionable.
+      - name: Dump macOS crash diagnostics (on failure)
+        if: failure()
+        shell: bash
+        run: |
+          echo "--- wheel contents ---"
+          unzip -l dist/*.whl | head -n 40 || true
+          echo "--- installed package ---"
+          PURE=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+          ls -la "$PURE" | grep -i -E "faster|openvino" || true
+          PKG=$(ls -d "$PURE"/faster_paddle* 2>/dev/null | head -n 1)
+          echo "PKG=$PKG"
+          if [ -n "$PKG" ] && [ -d "$PKG" ]; then
+            ls -la "$PKG"
+            for f in "$PKG"/*.dylib "$PKG"/*.so; do
+              [ -e "$f" ] || continue
+              echo "== $f"
+              otool -l "$f" | grep -A3 LC_RPATH || echo "  (no LC_RPATH)"
+              otool -L "$f" || true
+            done
+          fi
+          echo "--- crash reports ---"
+          ls -lt ~/Library/Logs/DiagnosticReports/ 2>/dev/null | head -n 10 || echo "(no DiagnosticReports)"
+          latest=$(ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -n 1)
+          if [ -n "$latest" ]; then echo "== $latest (first 600 lines)"; head -n 600 "$latest"; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-ov-macos-${{ matrix.target }}
+          path: dist
+
   sdist:
     runs-on: ubuntu-latest
     steps:
@@ -187,6 +436,9 @@ jobs:
   # The default wheel bundles no model weights; every size ships as a GitHub
   # Release asset and the library downloads it on demand on first use
   # (see model_bytes in src/lib.rs). Asset names must match the runtime URL.
+  # The OV wheel's IR weights ride along the same way (see ir_file_resolved):
+  # converted here from the same .onnx files with the pinned OV version, so
+  # runtime numerics match what CI tested.
   model-assets:
     name: Upload model weights to release
     runs-on: ubuntu-latest
@@ -195,6 +447,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: Stage assets (names must match the runtime download URL)
         run: |
           cp models/tiny/det.onnx ppocrv6_tiny_det.onnx
@@ -203,6 +458,9 @@ jobs:
           cp models/small/rec.onnx ppocrv6_small_rec.onnx
           cp models/medium/det.onnx ppocrv6_medium_det.onnx
           cp models/medium/rec.onnx ppocrv6_medium_rec.onnx
+          python -m pip install "openvino==${{ env.OV_VERSION }}"
+          python scripts/convert_ir.py . tiny small medium --flat
+          ls -la ppocrv6_*
       - uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -212,6 +470,18 @@ jobs:
             ppocrv6_small_rec.onnx
             ppocrv6_medium_det.onnx
             ppocrv6_medium_rec.onnx
+            ppocrv6_tiny_det.xml
+            ppocrv6_tiny_det.bin
+            ppocrv6_tiny_rec.xml
+            ppocrv6_tiny_rec.bin
+            ppocrv6_small_det.xml
+            ppocrv6_small_det.bin
+            ppocrv6_small_rec.xml
+            ppocrv6_small_rec.bin
+            ppocrv6_medium_det.xml
+            ppocrv6_medium_det.bin
+            ppocrv6_medium_rec.xml
+            ppocrv6_medium_rec.bin
 
   # Tag-only: proves the uploaded assets are fetchable under the exact names
   # the runtime downloads (guards against misnamed/missing assets). Runs after
@@ -243,16 +513,51 @@ jobs:
           print('download OK:', cfg['det_model_size'], cfg['det_source'], cfg['rec_source'])
           "
 
+  # Tag-only: proves the uploaded IR assets are fetchable under the exact names
+  # the OV backend downloads (mirrors download-check). No checkout, no local
+  # weights: constructing backend="ov" must pull all four IR files.
+  ov-download-check:
+    name: Check on-demand IR download (OV wheel)
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-ov, model-assets]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-ov-linux-x86_64
+          path: dist
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install pillow dist/*.whl
+      - name: Construct an OV engine with no local weights (forces IR download)
+        shell: bash
+        env:
+          OCR_THREADS: "2"
+        run: |
+          python -c "
+          from PIL import Image, ImageDraw
+          im = Image.new('RGB', (800, 200), 'white')
+          ImageDraw.Draw(im).text((20, 60), 'Hello OV 123', fill='black')
+          im.save('/tmp/ov-smoke.png')
+          from faster_paddle import OcrEngine
+          eng = OcrEngine(model_size='tiny', backend='ov', threads=2)
+          cfg = eng.config
+          assert (cfg['det_source'], cfg['rec_source']) == ('downloaded', 'downloaded'), cfg
+          r = eng.ocr(open('/tmp/ov-smoke.png', 'rb').read())
+          print('ov download OK:', cfg['det_model_size'], cfg['det_source'], cfg['rec_source'], '| boxes:', len(r['bounds']))
+          "
+
   # Tag-only: attach the prebuilt wheels (+ sdist) to the GitHub release so
   # consumers can install without Rust/MSVC, e.g.
-  #   uv pip install https://github.com/phruut/faster-paddle/releases/download/v1.1.2/<wheel-file>
-  # Gated on download-check so the two softprops/action-gh-release writers
-  # (model-assets, then this) never race each other on the same tag.
+  #   uv pip install https://github.com/phruut/faster-paddle/releases/download/v1.2.0/<wheel-file>
+  # Gated on both download checks so the two softprops/action-gh-release
+  # writers (model-assets, then this) never race each other on the same tag.
   release:
     name: Attach wheels to release
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [tests, linux, windows, macos, sdist, download-check]
+    needs: [tests, linux, windows, macos, sdist, download-check, linux-ov, windows-ov, macos-ov, ov-download-check]
     permissions:
       contents: write
     steps:

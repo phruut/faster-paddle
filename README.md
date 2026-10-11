@@ -2,7 +2,9 @@
 
 **Fast, CPU-only OCR in Rust with Python bindings** — a self-contained
 reimplementation of PaddleOCR's PP-OCRv6 detection + recognition pipeline
-powered by [ONNX Runtime](https://onnxruntime.ai/).
+powered by [ONNX Runtime](https://onnxruntime.ai/), with an opt-in
+[OpenVINO](https://www.intel.com/content/www/us/en/developer/tools/openvino-toolkit/overview.html)
+backend for lower latency.
 
 - ⚡ CPU latency optimizations: fused image transforms, compact DB components,
   dynamic recognition scheduling, and model-specific input widths.
@@ -27,9 +29,42 @@ See [performance results and tradeoffs](PERFORMANCE_CHANGES.md) and the
 
 ## Install
 
+There are no PyPI releases. Wheels are attached to each GitHub release —
+pick the file matching your platform, then install it directly:
+
 ```bash
-pip install faster-paddle
+uv pip install https://github.com/phruut/faster-paddle/releases/download/v1.2.0/<wheel-file>
+# or
+pip install https://github.com/phruut/faster-paddle/releases/download/v1.2.0/<wheel-file>
 ```
+
+Replace `v1.2.0` with the release you want; the [releases page](https://github.com/phruut/faster-paddle/releases)
+lists the available wheel files per platform.
+
+Each release ships two wheel variants per platform (same API, same models).
+They are separate distributions, so the filenames differ:
+
+| wheel file | inference | download | pick it when |
+|---|---|---|---|
+| `faster_paddle-1.2.0-...-win_amd64.whl` | ONNX Runtime, linked in | ~9 MB | you want the minimal install |
+| `faster_paddle_openvino-1.2.0-...-win_amd64.whl` | OpenVINO, DLLs bundled | ~27 MB (~90 MB installed) | you want lower latency (see below) |
+
+Both are self-contained: no Python `onnxruntime`/`openvino` package, no
+`PATH` setup, no second install. Model weights download on first use either
+way — ONNX weights for `"ort"`, IR weights (`ppocrv6_{size}_{det,rec}.xml`/`.bin`
+release assets) for `"ov"`. Choose the backend per engine (default wheel only
+offers `"ort"`):
+
+```python
+engine = OcrEngine(model_size="small")                 # ONNX Runtime
+engine = OcrEngine(model_size="small", backend="ov")   # OpenVINO (OV wheel only)
+```
+
+`"ov"` is 20–70% faster end to end on small/medium (tiny is roughly tied),
+at the cost of minor numeric drift: ~1px box shifts and occasional
+CTC-fragile glyph flips, the same class of difference as ONNX Runtime vs
+PaddlePaddle. Labeled-corpus recall is unchanged. `engine.config["backend"]`
+reports which one is running.
 
 **v1.0.4 upgrades the bundled native ONNX Runtime from 1.24.2 to 1.28.0.**
 This runtime is linked into the Rust extension; no Python `onnxruntime` package
@@ -262,7 +297,7 @@ Setting                                            Value
 | `faster_paddle.ocr(image, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb") -> dict` | OCR encoded image bytes or a uint8 numpy array (shared default engine). |
 | `faster_paddle.ocr_batch(images, *, batch_size=4, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb") -> list[dict]` | OCR multiple encoded images/arrays; results preserve input order. |
 | `faster_paddle.ocr_base64(image_base64, resize=False, denoise=False, deskew=False, binarize=False) -> dict` | OCR a base64 image string. |
-| `OcrEngine(model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_model_size=None, rec_model_size=None, model_dir=None, det_min_side=None, rec_min_width=None)` | Construct a reusable engine. |
+| `OcrEngine(model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_model_size=None, rec_model_size=None, model_dir=None, det_min_side=None, rec_min_width=None, backend="ort")` | Construct a reusable engine (`backend`: `"ort"` or `"ov"`; `"ov"` needs the OpenVINO wheel). |
 | `OcrEngine.ocr(image, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb") -> dict` | OCR encoded image bytes or a uint8 numpy array. |
 | `OcrEngine.ocr_batch(images, *, batch_size=4, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb") -> list[dict]` | OCR multiple encoded images/arrays; results preserve input order. |
 | `OcrEngine.rec(crops, colorspace="rgb") -> list[{"text": str, "confidence": float}]` | Recognize pre-cropped line images (bytes or arrays), skipping detection; input order preserved. |
@@ -364,6 +399,25 @@ sizes).
 
 Requires a Rust toolchain. ONNX Runtime is fetched automatically by the `ort`
 crate at build time and linked into the extension.
+
+To build the OpenVINO wheel instead (`faster-paddle-openvino`, `backend="ov"`),
+rename the distribution and enable the feature with the native libs available:
+
+```bash
+# one-time: pip install "openvino==2026.4.1" libclang  (pins in CI: OV_VERSION)
+# then point the build at its libs (here: the pip layout):
+#   $env:OV_LIB_DIR='<python>/Lib/site-packages/openvino/libs'
+sed -i 's/^name = "faster-paddle"$/name = "faster-paddle-openvino"/' pyproject.toml
+maturin build --release --features openvino-backend
+```
+(Windows dev shells: same rename via any string replace; CI uses bash on all
+platforms, so the `sed` line works there verbatim.)
+
+`build.rs` vendors the CPU-only OpenVINO runtime into the wheel, so the
+result installs anywhere with no extra setup. IR weights are converted from
+the `.onnx` files with the same pinned OpenVINO (`ov.convert_model` +
+`ov.save_model`) and resolve from `OV_IR_DIR`/`model_dir`, cache, or release
+download — see Install.
 
 ## Tests
 

@@ -11,6 +11,8 @@ mod cv;
 mod hardware;
 mod layout;
 mod ocr;
+#[cfg(feature = "openvino-backend")]
+mod ov_backend;
 mod preprocess;
 
 // Older-glibc compatibility shims. Prebuilt components (ONNX Runtime, Rust std)
@@ -71,12 +73,94 @@ use numpy::{
     PyUntypedArrayMethods as _,
 };
 use ocr::{Engine, ImageRgb};
+/// Inference backend behind an engine. The default ORT path is unchanged;
+/// the OpenVINO twin is opt-in (`backend="ov"`, needs the
+/// `openvino-backend` cargo feature) and mirrors the ORT engine's API.
+enum BackendEngine {
+    Ort(Engine),
+    #[cfg(feature = "openvino-backend")]
+    Ov(ov_backend::OvEngine),
+}
+
+impl BackendEngine {
+    fn workers(&self) -> Arc<rayon::ThreadPool> {
+        match self {
+            BackendEngine::Ort(e) => e.workers.clone(),
+            #[cfg(feature = "openvino-backend")]
+            BackendEngine::Ov(e) => e.workers.clone(),
+        }
+    }
+
+    fn run(&mut self, img: &ImageRgb) -> Result<Vec<ocr::OcrResult>, String> {
+        match self {
+            BackendEngine::Ort(e) => e.run(img).map_err(|e| e.to_string()),
+            #[cfg(feature = "openvino-backend")]
+            BackendEngine::Ov(e) => e.run(img),
+        }
+    }
+
+    fn run_many(&mut self, images: &[ImageRgb]) -> Result<Vec<Vec<ocr::OcrResult>>, String> {
+        match self {
+            BackendEngine::Ort(e) => e.run_many(images).map_err(|e| e.to_string()),
+            #[cfg(feature = "openvino-backend")]
+            BackendEngine::Ov(e) => e.run_many(images),
+        }
+    }
+
+    fn rec(&mut self, crops: &[ImageRgb]) -> Result<Vec<(String, f32)>, String> {
+        match self {
+            BackendEngine::Ort(e) => e.rec(crops).map_err(|e| e.to_string()),
+            #[cfg(feature = "openvino-backend")]
+            BackendEngine::Ov(e) => e.rec(crops),
+        }
+    }
+
+    fn det(&mut self, img: &ImageRgb) -> Result<Vec<[i32; 4]>, String> {
+        match self {
+            BackendEngine::Ort(e) => e.det(img).map_err(|e| e.to_string()),
+            #[cfg(feature = "openvino-backend")]
+            BackendEngine::Ov(e) => e.det(img),
+        }
+    }
+
+    fn set_input_limits(&mut self, det_min: Option<i64>, rec_min: Option<usize>) {
+        match self {
+            BackendEngine::Ort(e) => e.set_input_limits(det_min, rec_min),
+            #[cfg(feature = "openvino-backend")]
+            BackendEngine::Ov(e) => e.set_input_limits(det_min, rec_min),
+        }
+    }
+
+    fn settings(&self) -> Vec<(&'static str, usize)> {
+        match self {
+            BackendEngine::Ort(e) => e.settings(),
+            #[cfg(feature = "openvino-backend")]
+            BackendEngine::Ov(e) => e.settings(),
+        }
+    }
+
+    fn model_names(&self) -> Vec<(&'static str, String)> {
+        match self {
+            BackendEngine::Ort(e) => e.model_names(),
+            #[cfg(feature = "openvino-backend")]
+            BackendEngine::Ov(e) => e.model_names(),
+        }
+    }
+
+    fn det_settings(&self) -> Vec<(&'static str, f64)> {
+        match self {
+            BackendEngine::Ort(e) => e.det_settings(),
+            #[cfg(feature = "openvino-backend")]
+            BackendEngine::Ov(e) => e.det_settings(),
+        }
+    }
+}
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
 use std::borrow::Cow;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // ---- model weights (optional at build time) ----
 // The default wheel bundles nothing. Each size resolves as: local `model_dir`
@@ -231,18 +315,35 @@ fn resolve_rec(
     Ok((Cow::Owned(bytes), dict, source))
 }
 
-/// Cache hit or one-time download of a non-bundled ONNX file. Returns the
-/// bytes and whether they were `cached` or `downloaded`.
-fn model_bytes(size: &str, filename: &str, asset: &str) -> PyResult<(Vec<u8>, &'static str)> {
-    let cache = dirs::cache_dir()
+/// Release host for one-time model downloads. Overridable for testing via
+/// `FASTER_PADDLE_RELEASE_BASE` (e.g. a local mirror); production uses the
+/// GitHub release.
+fn release_base() -> String {
+    std::env::var("FASTER_PADDLE_RELEASE_BASE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| RELEASE_BASE.to_string())
+}
+
+/// Per-size cache directory shared by ONNX and IR weights.
+fn cache_dir_for(size: &str) -> PyResult<std::path::PathBuf> {
+    dirs::cache_dir()
         .ok_or_else(|| {
             PyRuntimeError::new_err(format!(
                 "cannot determine a cache directory for {size} models"
             ))
-        })?
-        .join("faster_paddle")
-        .join(format!("v{VERSION}"))
-        .join(size);
+        })
+        .map(|d| {
+            d.join("faster_paddle")
+                .join(format!("v{VERSION}"))
+                .join(size)
+        })
+}
+
+/// Cache hit or one-time download of a non-bundled ONNX file. Returns the
+/// bytes and whether they were `cached` or `downloaded`.
+fn model_bytes(size: &str, filename: &str, asset: &str) -> PyResult<(Vec<u8>, &'static str)> {
+    let cache = cache_dir_for(size)?;
     let path = cache.join(filename);
     if let Ok(bytes) = std::fs::read(&path) {
         if bytes.len() > 1024 {
@@ -258,6 +359,25 @@ fn fetch_cached(
     asset: &str,
     size: &str,
 ) -> PyResult<Vec<u8>> {
+    fetch_cached_with_hint(
+        cache_dir,
+        filename,
+        asset,
+        size,
+        &format!(
+            "pass model_dir with local weights or rebuild with \
+             `--features bundled-{size}` for offline use"
+        ),
+    )
+}
+
+fn fetch_cached_with_hint(
+    cache_dir: &std::path::Path,
+    filename: &str,
+    asset: &str,
+    size: &str,
+    offline_hint: &str,
+) -> PyResult<Vec<u8>> {
     let path = cache_dir.join(filename);
     if let Ok(bytes) = std::fs::read(&path) {
         if bytes.len() > 1024 {
@@ -266,12 +386,10 @@ fn fetch_cached(
     }
     std::fs::create_dir_all(cache_dir)
         .map_err(|e| PyRuntimeError::new_err(format!("cannot create cache dir: {e}")))?;
-    let url = format!("{RELEASE_BASE}/v{VERSION}/{asset}");
+    let url = format!("{}/v{VERSION}/{asset}", release_base());
     let resp = ureq::get(&url).call().map_err(|e| {
         PyRuntimeError::new_err(format!(
-            "failed to download {size} model from {url}: {e}; \
-             pass model_dir with local weights or rebuild with \
-             `--features bundled-{size}` for offline use"
+            "failed to download {size} model from {url}: {e}; {offline_hint}"
         ))
     })?;
     let mut bytes = Vec::new();
@@ -516,6 +634,7 @@ fn env_bool(name: &str) -> Option<bool> {
 
 #[allow(clippy::too_many_arguments)]
 fn new_engine(
+    backend: &str,
     model_size: &str,
     det_model_size: Option<&str>,
     rec_model_size: Option<&str>,
@@ -531,7 +650,7 @@ fn new_engine(
     det_max_candidates: Option<usize>,
     text_score: Option<f32>,
     det_use_dilation: Option<bool>,
-) -> PyResult<(Engine, &'static str, &'static str, Option<String>)> {
+) -> PyResult<(BackendEngine, &'static str, &'static str, Option<String>)> {
     if threads == Some(0) || rec_batch == Some(0) {
         return Err(PyValueError::new_err(
             "threads and rec_batch must be positive",
@@ -579,6 +698,15 @@ fn new_engine(
             "text_score must be between 0.0 and 1.0",
         ));
     }
+    let backend: &'static str = match backend {
+        "ort" => "ort",
+        "ov" => "ov",
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown backend {other:?}; expected 'ort' or 'ov'"
+            )))
+        }
+    };
     let det_use_dilation = det_use_dilation
         .or_else(|| env_bool("OCR_DET_USE_DILATION"))
         .unwrap_or(false);
@@ -589,41 +717,19 @@ fn new_engine(
     let det_size = det_model_size.unwrap_or(model_size);
     let rec_size = rec_model_size.unwrap_or(model_size);
     let dir = resolve_model_dir(model_dir);
-    let (det_bytes, box_default, det_source) = resolve_det(det_size, dir.as_deref())?;
-    let (rec_bytes, dict, rec_source) = resolve_rec(rec_size, dir.as_deref())?;
     let det_t = env_usize("OCR_DET_THREADS").unwrap_or(t.min(8)).clamp(1, t);
-    let rb = rec_batch.unwrap_or(ocr::DEFAULT_REC_BATCH);
     let det_max = det_max_side.unwrap_or(ocr::DEFAULT_DET_MAX_SIDE);
     let pool = env_usize("REC_POOL")
-        .unwrap_or(t.min(if rec_size == "medium" { 8 } else { 32 }))
+        .unwrap_or(if backend == "ov" {
+            // Measured: the OV worker pool scales inversely past ~2 workers
+            // (per-model stream contention across bucket compiles), while ORT
+            // sessions scale with cores. Backend-specific default; override
+            // with REC_POOL.
+            2
+        } else {
+            t.min(if rec_size == "medium" { 8 } else { 32 })
+        })
         .clamp(1, t);
-    let det_box_thresh = det_box_thresh
-        .or_else(|| env_float("OCR_DET_BOX_THRESH").map(|v| v as f32))
-        .unwrap_or(box_default);
-    if !(0.0..=1.0).contains(&det_box_thresh) {
-        return Err(PyValueError::new_err(
-            "det_box_thresh must be between 0.0 and 1.0",
-        ));
-    }
-    let mut engine = Engine::from_memory(
-        det_size,
-        rec_size,
-        &det_bytes,
-        &rec_bytes,
-        dict,
-        t,
-        det_t,
-        rb,
-        det_box_thresh,
-        det_thresh,
-        det_unclip_ratio,
-        det_max_candidates,
-        text_score,
-        det_use_dilation,
-        pool,
-        det_max,
-    )
-    .map_err(|e| PyRuntimeError::new_err(format!("failed to init OCR engine: {e}")))?;
     // Short-label validation supports smaller tensors for tiny/small. Medium
     // retains the reference floor until it has equivalent coverage.
     let width = rec_min_width
@@ -634,9 +740,211 @@ fn new_engine(
             _ => 320,
         })
         .clamp(64, 3200);
+    if backend == "ov" {
+        #[cfg(feature = "openvino-backend")]
+        return new_ov_engine(
+            det_size,
+            rec_size,
+            dir.as_deref(),
+            t,
+            det_t,
+            pool,
+            det_max,
+            det_box_thresh,
+            det_thresh,
+            det_unclip_ratio,
+            det_max_candidates,
+            text_score,
+            det_use_dilation,
+            det_min_side,
+            width,
+        );
+        #[cfg(not(feature = "openvino-backend"))]
+        return Err(PyRuntimeError::new_err(
+            "backend=\"ov\" needs a rebuild with `--features openvino-backend` \
+             (plus OpenVINO native libs at build time)",
+        ));
+    }
+    let (det_bytes, box_default, det_source) = resolve_det(det_size, dir.as_deref())?;
+    let (rec_bytes, dict, rec_source) = resolve_rec(rec_size, dir.as_deref())?;
+    let rb = rec_batch.unwrap_or(ocr::DEFAULT_REC_BATCH);
+    let det_box_thresh = det_box_thresh
+        .or_else(|| env_float("OCR_DET_BOX_THRESH").map(|v| v as f32))
+        .unwrap_or(box_default);
+    if !(0.0..=1.0).contains(&det_box_thresh) {
+        return Err(PyValueError::new_err(
+            "det_box_thresh must be between 0.0 and 1.0",
+        ));
+    }
+    let mut engine = BackendEngine::Ort(
+        Engine::from_memory(
+            det_size,
+            rec_size,
+            &det_bytes,
+            &rec_bytes,
+            dict,
+            t,
+            det_t,
+            rb,
+            det_box_thresh,
+            det_thresh,
+            det_unclip_ratio,
+            det_max_candidates,
+            text_score,
+            det_use_dilation,
+            pool,
+            det_max,
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to init OCR engine: {e}")))?,
+    );
     engine.set_input_limits(det_min_side, Some(width));
     let dir_str = dir.map(|p| p.to_string_lossy().into_owned());
     Ok((engine, det_source, rec_source, dir_str))
+}
+
+/// OpenVINO twin of the ORT construction path: same knobs, IR weights instead
+/// of ONNX bytes. `rec_batch` is always singleton here (static bucket
+/// shapes), so any user value is ignored and `config` reports 1.
+#[cfg(feature = "openvino-backend")]
+#[allow(clippy::too_many_arguments)]
+fn new_ov_engine(
+    det_size: &str,
+    rec_size: &str,
+    model_dir: Option<&std::path::Path>,
+    threads: usize,
+    det_threads: usize,
+    pool: usize,
+    det_max: i64,
+    det_box_thresh: Option<f32>,
+    det_thresh: f32,
+    det_unclip_ratio: f64,
+    det_max_candidates: usize,
+    text_score: f32,
+    det_use_dilation: bool,
+    det_min_side: Option<i64>,
+    rec_min_width: usize,
+) -> PyResult<(BackendEngine, &'static str, &'static str, Option<String>)> {
+    check_size(det_size)?;
+    check_size(rec_size)?;
+    // Same per-size box default as the ORT path (`resolve_det`).
+    let box_default = if det_size == "tiny" { 0.40 } else { 0.45 };
+    let det_box_thresh = det_box_thresh
+        .or_else(|| env_float("OCR_DET_BOX_THRESH").map(|v| v as f32))
+        .unwrap_or(box_default);
+    if !(0.0..=1.0).contains(&det_box_thresh) {
+        return Err(PyValueError::new_err(
+            "det_box_thresh must be between 0.0 and 1.0",
+        ));
+    }
+    // Weights resolve local-first, then cache/download — same contract as
+    // ONNX. `OV_IR_DIR`/explicit dir wins when it has the files; otherwise
+    // the release-hosted IR is fetched once and cached.
+    let ir_dir = resolve_ir_dir(model_dir);
+    let dict = match ir_dir.as_deref().and_then(|d| local_dict(Some(d), rec_size)) {
+        Some(json) => parse_dict_owned(&json, rec_size)?,
+        None => parse_dict(if rec_size == "tiny" {
+            TINY_DICT
+        } else {
+            BIG_DICT
+        }),
+    };
+    let (det_xml_asset, det_bin_asset) = ir_det_assets(det_size);
+    let (rec_xml_asset, rec_bin_asset) = ir_rec_assets(rec_size);
+    let (det_xml, det_src) = ir_file_resolved(ir_dir.as_deref(), det_size, "det.xml", det_xml_asset)?;
+    let (det_bin, _) = ir_file_resolved(ir_dir.as_deref(), det_size, "det.bin", det_bin_asset)?;
+    let (rec_xml, rec_src) = ir_file_resolved(ir_dir.as_deref(), rec_size, "rec.xml", rec_xml_asset)?;
+    let (rec_bin, _) = ir_file_resolved(ir_dir.as_deref(), rec_size, "rec.bin", rec_bin_asset)?;
+    let mut engine = BackendEngine::Ov(
+        ov_backend::OvEngine::from_files(
+            det_size,
+            rec_size,
+            &det_xml.to_string_lossy(),
+            &det_bin.to_string_lossy(),
+            &rec_xml.to_string_lossy(),
+            &rec_bin.to_string_lossy(),
+            dict,
+            threads,
+            det_threads,
+            det_box_thresh,
+            det_thresh,
+            det_unclip_ratio,
+            det_max_candidates,
+            text_score,
+            det_use_dilation,
+            pool,
+            det_max,
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to init OV engine: {e}")))?,
+    );
+    engine.set_input_limits(det_min_side, Some(rec_min_width));
+    let dir_str = ir_dir.map(|d| d.to_string_lossy().into_owned());
+    Ok((engine, det_src, rec_src, dir_str))
+}
+
+/// IR release asset names mirror the ONNX ones, with IR extensions. Attached
+/// to the GitHub release by the `model-assets` CI job; downloaded on demand
+/// exactly like ONNX weights.
+#[cfg(feature = "openvino-backend")]
+fn ir_det_assets(size: &str) -> (&'static str, &'static str) {
+    match size {
+        "tiny" => ("ppocrv6_tiny_det.xml", "ppocrv6_tiny_det.bin"),
+        "small" => ("ppocrv6_small_det.xml", "ppocrv6_small_det.bin"),
+        _ => ("ppocrv6_medium_det.xml", "ppocrv6_medium_det.bin"),
+    }
+}
+
+#[cfg(feature = "openvino-backend")]
+fn ir_rec_assets(size: &str) -> (&'static str, &'static str) {
+    match size {
+        "tiny" => ("ppocrv6_tiny_rec.xml", "ppocrv6_tiny_rec.bin"),
+        "small" => ("ppocrv6_small_rec.xml", "ppocrv6_small_rec.bin"),
+        _ => ("ppocrv6_medium_rec.xml", "ppocrv6_medium_rec.bin"),
+    }
+}
+
+/// IR weight directory: `OV_IR_DIR` wins, else the shared `model_dir`.
+/// Layout mirrors the ONNX layout: `{dir}/{size}/{det.xml,det.bin,rec.xml,rec.bin}`.
+/// `None` means straight to cache/download (first OV use fetches the release
+/// IR once, like ONNX weights).
+#[cfg(feature = "openvino-backend")]
+fn resolve_ir_dir(explicit: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    if let Ok(raw) = std::env::var("OV_IR_DIR") {
+        if !raw.is_empty() {
+            return Some(std::path::PathBuf::from(raw));
+        }
+    }
+    explicit.map(|p| p.to_path_buf())
+}
+
+/// One IR file: local layout first, else the shared cache or a one-time
+/// release download. Returns the path and `local`/`cached`/`downloaded`.
+#[cfg(feature = "openvino-backend")]
+fn ir_file_resolved(
+    dir: Option<&std::path::Path>,
+    size: &str,
+    filename: &str,
+    asset: &str,
+) -> PyResult<(std::path::PathBuf, &'static str)> {
+    if let Some(path) = dir.map(|d| d.join(size).join(filename)) {
+        if path.is_file() {
+            return Ok((path, "local"));
+        }
+    }
+    let cache = cache_dir_for(size)?;
+    let path = cache.join(filename);
+    if let Ok(bytes) = std::fs::read(&path) {
+        if bytes.len() > 1024 {
+            return Ok((path, "cached"));
+        }
+    }
+    fetch_cached_with_hint(
+        &cache,
+        filename,
+        asset,
+        size,
+        "pass OV_IR_DIR or model_dir with local IR weights for offline use",
+    )?;
+    Ok((path, "downloaded"))
 }
 
 /// Plain-Rust OCR output (GIL-free), assembled into a Python dict afterwards.
@@ -647,7 +955,7 @@ type RawResult = (
 );
 
 fn run_ocr(
-    engine: &Mutex<Engine>,
+    engine: &Mutex<BackendEngine>,
     raw: &RawInput,
     opts: preprocess::PreOpts,
 ) -> Result<RawResult, String> {
@@ -664,10 +972,10 @@ fn run_ocr(
     }
     // Preprocessing may resize/rotate the image; `transform` maps detected boxes
     // back to the ORIGINAL image coordinates so returned bounds stay aligned.
-    let workers = engine.lock().map_err(|e| e.to_string())?.workers.clone();
+    let workers = engine.lock().map_err(|e| e.to_string())?.workers();
     let (img, transform) = workers.install(|| preprocess::preprocess(img, &opts));
     let mut eng = engine.lock().map_err(|e| e.to_string())?;
-    let res = eng.run(&img).map_err(|e| e.to_string())?;
+    let res = eng.run(&img)?;
     drop(eng);
     Ok(finish_ocr(res, transform))
 }
@@ -706,13 +1014,13 @@ fn finish_ocr(res: Vec<ocr::OcrResult>, transform: preprocess::Transform) -> Raw
 /// Decode bounded windows in parallel, then share recognition work across pages.
 /// Array inputs skip decoding; bytes decode here without the GIL.
 fn run_ocr_batch(
-    engine: &Mutex<Engine>,
+    engine: &Mutex<BackendEngine>,
     raws: &[RawInput],
     opts: preprocess::PreOpts,
     batch_size: usize,
 ) -> Result<Vec<RawResult>, String> {
     use rayon::prelude::*;
-    let workers = engine.lock().map_err(|e| e.to_string())?.workers.clone();
+    let workers = engine.lock().map_err(|e| e.to_string())?.workers();
     let mut output = Vec::with_capacity(raws.len());
     for chunk in raws.chunks(batch_size) {
         let prepared: Result<Vec<_>, String> = workers.install(|| {
@@ -730,8 +1038,7 @@ fn run_ocr_batch(
         let results = engine
             .lock()
             .map_err(|e| e.to_string())?
-            .run_many(&imgs)
-            .map_err(|e| e.to_string())?;
+            .run_many(&imgs)?;
         output.extend(workers.install(|| {
             results
                 .into_par_iter()
@@ -744,12 +1051,12 @@ fn run_ocr_batch(
 }
 
 /// Decode crops and read each one in order; `(text, confidence)` per crop, unfiltered.
-fn run_rec(engine: &Mutex<Engine>, raws: &[RawInput]) -> Result<Vec<(String, f32)>, String> {
+fn run_rec(engine: &Mutex<BackendEngine>, raws: &[RawInput]) -> Result<Vec<(String, f32)>, String> {
     use rayon::prelude::*;
     if raws.is_empty() {
         return Ok(Vec::new());
     }
-    let workers = engine.lock().map_err(|e| e.to_string())?.workers.clone();
+    let workers = engine.lock().map_err(|e| e.to_string())?.workers();
     let imgs: Result<Vec<ImageRgb>, String> = workers.install(|| {
         raws.par_iter()
             .enumerate()
@@ -760,17 +1067,15 @@ fn run_rec(engine: &Mutex<Engine>, raws: &[RawInput]) -> Result<Vec<(String, f32
         .lock()
         .map_err(|e| e.to_string())?
         .rec(&imgs?)
-        .map_err(|e| e.to_string())
 }
 
 /// Detect text boxes without recognizing; boxes are in source-image coordinates.
-fn run_det(engine: &Mutex<Engine>, raw: &RawInput) -> Result<Vec<[i32; 4]>, String> {
+fn run_det(engine: &Mutex<BackendEngine>, raw: &RawInput) -> Result<Vec<[i32; 4]>, String> {
     let img = raw_to_image(raw)?;
     engine
         .lock()
         .map_err(|e| e.to_string())?
         .det(&img)
-        .map_err(|e| e.to_string())
 }
 
 fn build_dict<'py>(py: Python<'py>, raw: RawResult) -> PyResult<Bound<'py, PyDict>> {
@@ -791,12 +1096,13 @@ fn build_dict<'py>(py: Python<'py>, raw: RawResult) -> PyResult<Bound<'py, PyDic
     Ok(out)
 }
 
-/// A reusable OCR engine holding the loaded ONNX sessions. Construct once and
-/// reuse across images. Thread-safe: calls are serialized internally and the
-/// GIL is released during inference.
+/// A reusable OCR engine holding the loaded inference sessions. Construct once
+/// and reuse across images. Thread-safe: calls are serialized internally and
+/// the GIL is released during inference.
 #[pyclass]
 struct OcrEngine {
-    inner: Mutex<Engine>,
+    inner: Mutex<BackendEngine>,
+    backend: &'static str,
     det_source: &'static str,
     rec_source: &'static str,
     model_dir: Option<String>,
@@ -831,8 +1137,12 @@ impl OcrEngine {
     ///     det_max_candidates: max det boxes kept (default 3000).
     ///     text_score: drop reads below this conf (default 0.0 keep-all).
     ///     det_use_dilation: 2x2 mask dilate before components (default False).
+    ///     backend: inference runtime, "ort" (default) or "ov". "ov" needs the
+    ///         `openvino-backend` build plus IR weights (`{dir}/{size}/det.xml`,
+    ///         `det.bin`, `rec.xml`, `rec.bin` in `OV_IR_DIR` or `model_dir`);
+    ///         its `rec_batch` is always singleton regardless of the argument.
     #[new]
-    #[pyo3(signature = (model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_model_size=None, rec_model_size=None, model_dir=None, det_min_side=None, rec_min_width=None, det_thresh=None, det_box_thresh=None, det_unclip_ratio=None, det_max_candidates=None, text_score=None, det_use_dilation=None))]
+    #[pyo3(signature = (model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_model_size=None, rec_model_size=None, model_dir=None, det_min_side=None, rec_min_width=None, det_thresh=None, det_box_thresh=None, det_unclip_ratio=None, det_max_candidates=None, text_score=None, det_use_dilation=None, backend="ort"))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -851,14 +1161,17 @@ impl OcrEngine {
         det_max_candidates: Option<usize>,
         text_score: Option<f32>,
         det_use_dilation: Option<bool>,
+        backend: &str,
     ) -> PyResult<Self> {
         // Model construction and downloads run without holding the GIL.
+        let backend_owned = backend.to_string();
         let size = model_size.to_string();
         let det_size = det_model_size.map(str::to_string);
         let rec_size = rec_model_size.map(str::to_string);
         let dir = model_dir.map(str::to_string);
         let (engine, det_source, rec_source, resolved_dir) = py.allow_threads(|| {
             new_engine(
+                &backend_owned,
                 &size,
                 det_size.as_deref(),
                 rec_size.as_deref(),
@@ -876,8 +1189,10 @@ impl OcrEngine {
                 det_use_dilation,
             )
         })?;
+        let backend_static: &'static str = if backend_owned == "ov" { "ov" } else { "ort" };
         Ok(Self {
             inner: Mutex::new(engine),
+            backend: backend_static,
             det_source,
             rec_source,
             model_dir: resolved_dir,
@@ -991,6 +1306,11 @@ impl OcrEngine {
         for (key, value) in models {
             out.set_item(key, value)?;
         }
+        out.set_item("backend", self.backend)?;
+        #[cfg(feature = "openvino-backend")]
+        if self.backend == "ov" {
+            out.set_item("ov_runtime", ov_backend::runtime_version())?;
+        }
         out.set_item("det_source", self.det_source)?;
         out.set_item("rec_source", self.rec_source)?;
         out.set_item("model_dir", self.model_dir.clone())?;
@@ -1103,8 +1423,7 @@ impl OcrEngine {
                     .inner
                     .lock()
                     .map_err(|e| e.to_string())?
-                    .workers
-                    .clone();
+                    .workers();
                 workers.install(|| prepare_raw(&raw, opts, return_array))
             })
             .map_err(PyRuntimeError::new_err)?;
@@ -1116,10 +1435,10 @@ impl OcrEngine {
 }
 
 // ---- module-level convenience using a lazily-built default engine ----
-static DEFAULT_ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
+static DEFAULT_ENGINE: OnceLock<Mutex<BackendEngine>> = OnceLock::new();
 static DEFAULT_INIT: Mutex<()> = Mutex::new(());
 
-fn default_engine() -> PyResult<&'static Mutex<Engine>> {
+fn default_engine() -> PyResult<&'static Mutex<BackendEngine>> {
     if let Some(e) = DEFAULT_ENGINE.get() {
         return Ok(e);
     }
@@ -1130,7 +1449,8 @@ fn default_engine() -> PyResult<&'static Mutex<Engine>> {
         return Ok(e);
     }
     let built = new_engine(
-        "tiny", None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+        "ort", "tiny", None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None,
     )?;
     Ok(DEFAULT_ENGINE.get_or_init(|| Mutex::new(built.0)))
 }

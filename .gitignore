@@ -7,3 +7,14 @@
 __pycache__/
 *.egg-info/
 .venv/
+# local scratch: A/B probes, IR conversions, result logs (never commit)
+/.temp/
+# working notes, superseded by PERFORMANCE_*.md when finalized
+.research/
+# local-only resolver output; the venv is bootstrapped with `uv sync`
+uv.lock
+# `maturin develop --features openvino-backend` (editable install) drops the
+# vendored runtime beside the extension in the source tree. Wheels get theirs
+# from OUT_DIR (see the pyproject include), so these are never committed.
+*.dll
+python/faster_paddle/plugins.xml
