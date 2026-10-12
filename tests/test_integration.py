@@ -719,7 +719,7 @@ def test_mirror_download_lands_in_cache_and_is_reused(tmp_path, monkeypatch):
     reports `downloaded` and lands both files byte-identically in the cache
     (no temp residue), a second engine with the mirror unreachable reuses them
     (`cached`), and a plausible-size but wrong-magic cache entry is refetched
-    (A2/A3 repair, E1 landing)."""
+    instead of trusted."""
     asset_root = tmp_path / "mirror" / ("v" + faster_paddle.__version__)
     asset_root.mkdir(parents=True)
     served = {}
@@ -738,7 +738,7 @@ def test_mirror_download_lands_in_cache_and_is_reused(tmp_path, monkeypatch):
 
     server = _serve_directory(asset_root.parent)
     try:
-        # trailing slash on purpose: the base URL must be trimmed (A13)
+        # trailing slash on purpose: the base URL must be trimmed
         monkeypatch.setenv(
             "FASTER_PADDLE_RELEASE_BASE", f"http://127.0.0.1:{server.server_port}/"
         )

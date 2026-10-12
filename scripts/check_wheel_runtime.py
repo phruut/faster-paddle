@@ -12,6 +12,7 @@ vendoring prefix because OpenVINO release numbers live in the filenames.
 Usage: python scripts/check_wheel_runtime.py dist/*.whl
 Exits 0 on success, 1 (with a GitHub ::error:: line) on any missing file.
 """
+
 import glob
 import os
 import re
