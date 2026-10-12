@@ -1640,8 +1640,9 @@ impl OcrEngine {
     /// in one pass (this does not run OCR). By default returns the prepared
     /// image as PNG bytes; with ``return_array=True`` returns a uint8
     /// ``(H, W, 3)`` numpy array instead (no PNG round-trip before ``ocr``).
-    /// If every option is ``False``, bytes pass through unchanged while arrays
-    /// only convert layouts.
+    /// If every option is ``False``, bytes pass through unchanged while array
+    /// input is returned as a layout-converted ``(H, W, 3)`` array regardless
+    /// of ``return_array``.
     #[pyo3(signature = (image, resize=false, denoise=false, deskew=false, binarize=false, colorspace="rgb", return_array=false))]
     fn prepare<'py>(
         &self,
@@ -1803,7 +1804,8 @@ fn py_ocr_base64<'py>(
 
 /// Apply the enabled preprocessing steps (no OCR). Returns PNG bytes by
 /// default, or a uint8 ``(H, W, 3)`` numpy array with ``return_array=True``.
-/// Returns the input unchanged when no option is set (bytes stay bytes).
+/// Returns the input unchanged when no option is set, except that array input
+/// is always returned as a layout-converted ``(H, W, 3)`` array.
 #[pyfunction]
 #[pyo3(name = "prepare", signature = (image, resize=false, denoise=false, deskew=false, binarize=false, colorspace="rgb", return_array=false))]
 fn py_prepare<'py>(

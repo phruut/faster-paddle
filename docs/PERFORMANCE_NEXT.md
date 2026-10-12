@@ -59,8 +59,9 @@ and [activation handling](https://github.com/microsoft/onnxruntime/pull/27821).
 
 1. **Upgrade the inference runtime and validate the complete Rust pipeline.**
    This is the best measured candidate that retains FP32 weights. The shipped
-   Rust dependency currently embeds ORT 1.24.2; installing a newer Python ORT
-   does not upgrade it. Integrate compatible native binaries/bindings, run real
+   Rust dependency embedded ORT 1.24.2 when this follow-up was written (1.28.0
+   since v1.0.4, see the update above); installing a newer Python ORT does not
+   upgrade the linked runtime. Integrate compatible native binaries/bindings, run real
    OCR comparisons, and build every supported platform before changing the
    package default. Recompiling Rust with `target-cpu=native` does not rebuild
    or retune the separately supplied ONNX Runtime kernels.
@@ -164,7 +165,7 @@ attempted after the earlier system disruption.
 
 ## Reproduce and inspect
 
-Added [memory_probe.py](benchmarks/memory_probe.py); it modifies candidate graphs
+Added [memory_probe.py](../benchmarks/memory_probe.py); it modifies candidate graphs
 only in memory. Install `numpy`, `onnx`, and the chosen `onnxruntime` version in
 an isolated environment, then run from the repository root:
 
@@ -178,10 +179,10 @@ taskset -c 0,2 nice -n 10 python benchmarks/memory_probe.py \
 
 Raw timed samples, graph estimates, profiles, and numerical comparisons are in:
 
-- [Variant probe, ORT 1.24.2](benchmarks/results/memory-probe-ort-1.24.2.jsonl)
-- [Runtime baseline, ORT 1.24.2](benchmarks/results/memory-runtime-1.24.2.jsonl)
-- [Runtime candidate, ORT 1.29.0](benchmarks/results/memory-runtime-1.29.0.jsonl)
-- [Cross-runtime numerical comparison](benchmarks/results/memory-runtime-numerics.jsonl)
+- [Variant probe, ORT 1.24.2](../benchmarks/results/memory-probe-ort-1.24.2.jsonl)
+- [Runtime baseline, ORT 1.24.2](../benchmarks/results/memory-runtime-1.24.2.jsonl)
+- [Runtime candidate, ORT 1.29.0](../benchmarks/results/memory-runtime-1.29.0.jsonl)
+- [Cross-runtime numerical comparison](../benchmarks/results/memory-runtime-numerics.jsonl)
 
 No production defaults, dependencies, model files, or release tags were changed
 in this follow-up. The probe executed successfully for both bundled models,

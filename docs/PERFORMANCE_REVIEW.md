@@ -11,7 +11,7 @@ crop fast path. Replacing these wholesale is unlikely to be the shortest path
 to lower latency.
 
 No production code or model weights were changed for this review. The benchmark
-harnesses and raw measurements are under [benchmarks](benchmarks/).
+harnesses and raw measurements are under [benchmarks](../benchmarks/).
 
 **Measured end-to-end results**
 

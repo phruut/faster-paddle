@@ -150,6 +150,10 @@ jobs:
           sed -i.bak 's/^name = "faster-paddle"$/name = "faster-paddle-openvino"/' pyproject.toml
           rm -f pyproject.toml.bak
           grep '^name = ' pyproject.toml
+          if ! grep -q '^name = "faster-paddle-openvino"$' pyproject.toml; then
+            echo "::error::pyproject.toml name was not renamed to faster-paddle-openvino; refusing to build a colliding OV wheel"
+            exit 1
+          fi
       - name: Build OV wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -282,6 +286,10 @@ jobs:
           sed -i.bak 's/^name = "faster-paddle"$/name = "faster-paddle-openvino"/' pyproject.toml
           rm -f pyproject.toml.bak
           grep '^name = ' pyproject.toml
+          if ! grep -q '^name = "faster-paddle-openvino"$' pyproject.toml; then
+            echo "::error::pyproject.toml name was not renamed to faster-paddle-openvino; refusing to build a colliding OV wheel"
+            exit 1
+          fi
       - name: Build OV wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -391,6 +399,10 @@ jobs:
           sed -i.bak 's/^name = "faster-paddle"$/name = "faster-paddle-openvino"/' pyproject.toml
           rm -f pyproject.toml.bak
           grep '^name = ' pyproject.toml
+          if ! grep -q '^name = "faster-paddle-openvino"$' pyproject.toml; then
+            echo "::error::pyproject.toml name was not renamed to faster-paddle-openvino; refusing to build a colliding OV wheel"
+            exit 1
+          fi
       - name: Build OV wheels
         uses: PyO3/maturin-action@v1
         with:

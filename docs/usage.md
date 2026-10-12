@@ -100,9 +100,12 @@ so they line up with your input.
 ## Preprocess only (no OCR)
 
 `prepare` runs the same preprocessing in one pass and returns the prepared
-image as **PNG bytes** (grayscale once any of denoise/deskew/binarize is on,
-else color). If every option is `False` the original bytes are returned
-unchanged.
+image as **PNG bytes**: an 8-bit grayscale PNG when every pixel has equal
+channels (denoise/deskew/binarize always produce gray; `resize` alone keeps
+the input's own colors), RGB otherwise. With every option `False`, bytes are
+returned unchanged; a numpy array is returned as the layout-converted
+`(H, W, 3)` array regardless of `return_array` (see
+[api.md](api.md#module-functions)).
 
 ```python
 prepared = engine.prepare(image_bytes, resize=True, denoise=True, deskew=True, binarize=False)

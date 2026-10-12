@@ -20,7 +20,7 @@ inference. One runtime per wheel, no Python inference packages.
   (`OcrEngine("tiny", rec_model_size="small")`).
 - Pure-Rust pre/post-processing (detection DB decode, `minAreaRect`,
   perspective crop, CTC decode, reading-order text reconstruction). No OpenCV.
-- Prebuilt wheels for Linux, Windows, macOS (x86-64 + arm64).
+- Prebuilt wheels for Linux (x86-64, arm64), Windows (x64), and macOS (arm64).
 
 Defaults respect available physical cores, Linux CPU affinity, and container
 CPU limits. Reuse an engine to amortize model/session loading. Performance
@@ -31,8 +31,9 @@ results and benchmark harnesses are linked at the
 
 ## Install
 
-There are no PyPI releases. Wheels are attached to each GitHub release, so
-pick the file matching your platform and install it directly:
+There are no PyPI releases. Wheels are attached to each GitHub release; pin
+the exact release you validated (the URLs are version-pinned, and release
+assets stay in place) and install its file directly:
 
 ```bash
 uv pip install https://github.com/phruut/faster-paddle/releases/download/v1.2.1/<wheel-file>
@@ -41,16 +42,29 @@ pip install https://github.com/phruut/faster-paddle/releases/download/v1.2.1/<wh
 ```
 
 Replace `v1.2.1` with the release you want; the [releases page](https://github.com/phruut/faster-paddle/releases)
-lists the available wheel files per platform.
+lists the available wheel files. Source builds are the fallback for platforms
+without a wheel; releases before v1.1.1 have no prebuilt wheels at all.
 
-Each release ships two wheel variants per platform (same API, same models).
-They are separate distributions with one inference runtime each, so the
-filenames differ:
+Each release ships up to two wheel variants (same API, same models): the ONNX
+Runtime wheel and the OpenVINO wheel. They are separate distributions with one
+inference runtime each, so the filenames differ:
 
 | wheel file | inference | download | pick it when |
 |---|---|---|---|
 | `faster_paddle-1.2.1-...-win_amd64.whl` | ONNX Runtime, linked in | ~9 MB | you want the minimal install |
 | `faster_paddle_openvino-1.2.1-...-win_amd64.whl` | OpenVINO, DLLs bundled | ~20 MB (~65 MB installed) | you want lower latency (not always) |
+
+Wheel coverage per platform:
+
+| platform | ONNX Runtime wheel | OpenVINO wheel |
+|---|---|---|
+| Linux x86-64, glibc 2.34+ (`manylinux_2_34`) | yes | yes |
+| Linux arm64, glibc 2.28+ (`manylinux_2_28`) | yes | no (no PyPI OpenVINO wheel) |
+| Windows x64 | yes | yes |
+| macOS arm64 | yes | yes |
+
+There are no macOS x86-64 or Windows arm64 wheels. The manylinux tags are
+glibc floors: x86-64 needs glibc 2.34+ (ONNX Runtime), arm64 needs 2.28+.
 
 Both are self-contained: no Python `onnxruntime`/`openvino` package, no
 `PATH` setup, no second install. Model weights download on first use either
@@ -63,11 +77,14 @@ engine = OcrEngine(model_size="small")                 # ONNX Runtime (default w
 engine = OcrEngine(model_size="small", backend="ov")   # OpenVINO (OpenVINO wheel)
 ```
 
-`"ov"` is 20-70% faster end to end on small/medium (tiny is roughly tied), at
-the cost of minor numeric drift: ~1px box shifts and occasional CTC-fragile
-glyph flips, the same class of difference as ONNX Runtime vs PaddlePaddle.
-Labeled-corpus recall is unchanged. `engine.config["backend"]` reports which
-one is running.
+Local A/B probes measured `"ov"` 20-70% faster end to end on small/medium (tiny
+roughly tied), at the cost of minor numeric drift: ~1px box shifts and
+occasional CTC-fragile glyph flips, the same class of difference as ONNX
+Runtime vs PaddlePaddle; labeled-corpus recall was unchanged in those probes.
+These OV numbers are **unverified in-repo**: the raw probes were not retained
+and the committed benchmark harnesses run ONNX Runtime only, so treat them as
+a direction, not a guarantee. `engine.config["backend"]` reports which one is
+running.
 
 The native ONNX Runtime (1.28.0) is statically linked into the Rust
 extension; inspect it with `faster_paddle.__runtime_build__`. See the
@@ -170,8 +187,9 @@ Both are always returned, so pick per use case:
   layout: whitespace gaps split the page into columns/panes, and rows inside
   each pane keep their indentation and aligned sub-columns. Use it for
   screenshots, forms, table/tree UIs, and code.
-- `text` merges columns into plain reading-order lines. Use it for dense
-  multi-column prose, where `structured_text`'s pixel-accurate spacing
+- `text` also separates page blocks, but then flattens each one into plain
+  reading-order lines without indentation or sub-column alignment. Use it for
+  dense multi-column prose, where `structured_text`'s pixel-accurate spacing
   produces very wide lines.
 
 A worked example is in [docs/usage.md](docs/usage.md#structured_text).
@@ -181,9 +199,11 @@ A worked example is in [docs/usage.md](docs/usage.md#structured_text).
 ## Performance
 
 - The [performance changelog](docs/PERFORMANCE_CHANGES.md) records what was
-  measured and changed (runtime upgrade, scheduling, memory).
+  measured and changed (runtime upgrade, scheduling, memory); its "unverified"
+  section marks numbers whose raw artifacts were not retained.
 - Reproducible harnesses live in `benchmarks/` (`cpu_latency.py`,
-  `batch_latency.py`, graph and memory probes).
+  `batch_latency.py`, graph and memory probes). They currently target the ONNX
+  Runtime backend; no committed harness reproduces the OpenVINO figures above.
 
 ## Docs
 

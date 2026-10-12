@@ -22,7 +22,8 @@ upload, and all platforms must pass before publication.
 Linux ARM64 explicitly links GCC's outlined atomic helpers required by the
 new native archive; the installed-wheel tests caught this import-time issue.
 
-Local validation: 23 Rust tests and 16 installed-wheel integration tests passed.
+Local validation at the time (v1.0.4): 23 Rust tests and 16 installed-wheel
+integration tests passed; the suite has grown since.
 The published v1.0.3 wheel and locally built v1.0.4 wheel were compared on the
 same 11 inputs for both tiny and small, using two CPU cores, low priority,
 `OCR_THREADS=2`, one warmup and three timed full OCR calls per case. Model
@@ -40,8 +41,8 @@ required to be bit-identical. The corpus is small and primarily Latin-script.
 These are bounded local measurements, not universal speed guarantees or the
 earlier full-CPU benchmark configuration. Raw results include all inputs,
 timings, recognized output, package version and candidate runtime build:
-[v1.0.3](benchmarks/results/upgrade-1.0.3.jsonl),
-[v1.0.4](benchmarks/results/upgrade-1.0.4.jsonl).
+[v1.0.3](../benchmarks/results/upgrade-1.0.3.jsonl),
+[v1.0.4](../benchmarks/results/upgrade-1.0.4.jsonl).
 The remaining sections describe the v1.0.2 optimizations and historical probes.
 
 **Resolved defaults**
@@ -58,6 +59,12 @@ The remaining sections describe the v1.0.2 optimizations and historical probes.
 | Detector size limits | Minimum short side 736, maximum long side 1600, rounded to multiples of 32 |
 | ONNX spinning | Enabled during inference, forcibly stopped when each inference call returns |
 | Approximate GELU | Disabled |
+
+This table describes the ONNX Runtime backend. The OpenVINO backend differs:
+its recognition pool defaults to 2 workers instead of one per core, recognition
+batches are singletons, it compiles one static model per width bucket, and it
+budgets one stream per worker instead of ORT's spinning session setup. See
+[api.md](api.md#parallelism).
 
 `engine.config` exposes the resolved settings. `threads` overrides detection of
 the total budget. Environment overrides and the two new keyword arguments
@@ -95,8 +102,9 @@ CPU architectures and document distributions can have different optima.
 - Wheels no longer include a second copy of ONNX model files already embedded
   in the extension. Source distributions explicitly include the build script
   and compilation assets, excluding incidental test caches.
-- The resolved ort rc.12 version is pinned; the unused direct ndarray version
-  was removed. CI now runs Rust and Python tests before publishing.
+- The resolved ort version is pinned (rc.12 at the time of this work; rc.13 /
+  ONNX Runtime 1.28.0 since v1.0.4); the unused direct ndarray version was
+  removed. CI now runs Rust and Python tests before publishing.
 
 **Multiple images**
 
@@ -121,12 +129,16 @@ calls on dense pages. `ocr` remains the choice for the earliest individual-page
 response. Invalid input reports its zero-based image index without poisoning
 the engine; an empty list returns an empty list.
 
-**Measurements collected before the execution environment changed**
+**Unverified measurements (raw artifacts not retained)**
 
-Host: Ryzen 9 9950X3D, 16 physical / 32 logical CPUs, Linux under a Microsoft
-hypervisor, release build, ONNX Runtime 1.24.2 CPU. The screenshot is the bundled
-804×505 fixture. The retained original baseline contains ten warm samples per
-model; the revised spinning comparison also contained ten per setting.
+The numbers in this section are kept for context but are **not reproducible
+from this repository**: the temporary implementation probes were lost when the
+execution environment changed, and no committed artifact contains these
+samples. Host: Ryzen 9 9950X3D, 16 physical / 32 logical CPUs, Linux under a
+Microsoft hypervisor, release build, ONNX Runtime 1.24.2 CPU. The screenshot is
+the bundled 804×505 fixture. The retained original baseline contains ten warm
+samples per model; the revised spinning comparison also contained ten per
+setting.
 
 | Screenshot | Original audit median | Revised settings median |
 |---|---:|---:|
@@ -198,8 +210,9 @@ both tiny and small, short labels, sparse wide jobs, ordered multi-image output,
 per-image coordinate transforms, mixed shapes, reused buffers, concurrent
 calls, explicit CPU budgets, affinity, invalid input and recovery.
 
-Final local validation passed 23 release-mode Rust tests and all 15 Python
-integration tests against the installed release wheel. Builds and inference
+Final local validation at the time passed 23 release-mode Rust tests and all
+15 Python integration tests against the installed release wheel; the suite has
+grown since. Builds and inference
 tests were restricted to two CPU cores at low scheduling priority. The wheel
 and source distribution built successfully; archive checks confirmed no
 duplicate model data in the wheel and the required build script, lockfile,
