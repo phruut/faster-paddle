@@ -313,7 +313,7 @@ fn stage_ov_libs(target_os: &str, target_arch: &str) {
         };
         let staged_name = recorded_library_name(&src.join(&source_name), target_os)
             .map(|raw| library_basename(&raw).to_string())
-            .filter(|n| !n.contains(|c| c == '/' || c == '\\'))
+            .filter(|n| !n.contains(['/', '\\']))
             .unwrap_or_else(|| source_name.clone());
         if staged_name.contains("cpu_plugin") {
             staged_plugin = Some(staged_name.clone());
