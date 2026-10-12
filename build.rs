@@ -1,3 +1,6 @@
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
 fn main() {
     println!("cargo:rerun-if-env-changed=ORT_CXX_STDLIB");
     // On Linux wheel builds we statically link the C++ runtime (libstdc++) so the
@@ -49,84 +52,216 @@ fn main() {
             println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path");
         }
         stage_ov_libs(&target_os, &target_arch);
+    } else {
+        // A feature-off build must not inherit files another OV build left in
+        // OUT_DIR (the maturin include below packs the whole dir), so prune
+        // defensively. Cargo hashes OUT_DIR per feature set, so this is
+        // normally a no-op.
+        prune_ov_staging(&target_os, &[]);
     }
 }
 
-/// One vendored runtime lib: exact filename (Windows) or a filename prefix
-/// whose most-specific match wins (Linux/macOS ship versioned names like
-/// `libopenvino.so.2641`, where `2641` tracks the OV release).
+/// One vendored runtime lib: a filename prefix whose most specific match wins
+/// (Linux/macOS ship versioned names like `libopenvino.so.2641`, where `2641`
+/// tracks the OV release; Windows names are unversioned).
 struct OvLib {
     prefix: &'static str,
+    /// The core library, probed for the `ov_core_set_properties` symbol.
+    core: bool,
 }
 
-fn ov_lib_patterns(target_os: &str, target_arch: &str) -> Vec<OvLib> {
-    // x86_64 uses the Intel CPU plugin; ARM64 the ARM CPU plugin.
-    let cpu_plugin: &'static str = if target_arch == "aarch64" || target_arch == "arm64" {
-        "openvino_arm_cpu_plugin"
-    } else {
-        "openvino_intel_cpu_plugin"
-    };
+fn is_arm(target_arch: &str) -> bool {
+    matches!(target_arch, "aarch64" | "arm64")
+}
+
+/// Filename prefixes of the vendored runtime for a target OS: the common
+/// libraries, then the Intel and ARM CPU plugin names. `None` for target OSes
+/// without a vendoring strategy (feature-off cleanup must not panic).
+fn ov_staging_names(target_os: &str) -> Option<(&'static [&'static str], [&'static str; 2])> {
     match target_os {
         // Windows names are unversioned and verified against the 2026.4.1 libs.
-        "windows" => [
-            "openvino.dll",
-            "openvino_c.dll",
-            "openvino_ir_frontend.dll",
-            "tbb12.dll",
-            "tbbbind_2_5.dll",
-        ]
-        .iter()
-        .map(|s| OvLib { prefix: s })
-        .chain(std::iter::once(OvLib {
-            prefix: if cpu_plugin == "openvino_arm_cpu_plugin" {
-                "openvino_arm_cpu_plugin.dll"
-            } else {
-                "openvino_intel_cpu_plugin.dll"
-            },
-        }))
-        .collect(),
+        "windows" => Some((
+            &[
+                "openvino.dll",
+                "openvino_c.dll",
+                "openvino_ir_frontend.dll",
+                "tbb12.dll",
+                "tbbbind_2_5.dll",
+            ],
+            [
+                "openvino_intel_cpu_plugin.dll",
+                "openvino_arm_cpu_plugin.dll",
+            ],
+        )),
         // Linux/macOS names below are verified against the pinned
         // `pip install openvino==OV_VERSION` layout (see CI): versioned core
         // libs (`libopenvino.so.2641`), unversioned plugins, tbb + hwloc.
         // Only linux x86_64 and macOS arm64 are verified — other targets need
         // a CI wheel run before release.
-        "linux" => [
-            "libopenvino.so.",
-            "libopenvino_c.so.",
-            "libopenvino_ir_frontend.so.",
-            "libtbb.so.12",
-            "libtbbbind_2_5.so.",
-            "libhwloc.so.",
-        ]
+        "linux" => Some((
+            &[
+                "libopenvino.so.",
+                "libopenvino_c.so.",
+                "libopenvino_ir_frontend.so.",
+                "libtbb.so.12",
+                "libtbbbind_2_5.so.",
+                "libhwloc.so.",
+            ],
+            [
+                "libopenvino_intel_cpu_plugin.so",
+                "libopenvino_arm_cpu_plugin.so",
+            ],
+        )),
+        "macos" => Some((
+            &[
+                "libopenvino.",
+                "libopenvino_c.",
+                "libopenvino_ir_frontend.",
+                "libtbb.12",
+                "libtbbbind_2_5.",
+                "libhwloc.",
+            ],
+            [
+                "libopenvino_intel_cpu_plugin.so",
+                "libopenvino_arm_cpu_plugin.so",
+            ],
+        )),
+        _ => None,
+    }
+}
+
+/// The files the current target requires in the wheel (the CPU plugin is
+/// per-arch). `None` for unsupported target OSes.
+fn ov_lib_patterns(target_os: &str, target_arch: &str) -> Option<Vec<OvLib>> {
+    let (common, plugins) = ov_staging_names(target_os)?;
+    let plugin = if is_arm(target_arch) {
+        plugins[1]
+    } else {
+        plugins[0]
+    };
+    let mut libs: Vec<OvLib> = common
         .iter()
-        .map(|s| OvLib { prefix: s })
-        .chain(std::iter::once(OvLib {
-            prefix: if cpu_plugin == "openvino_arm_cpu_plugin" {
-                "libopenvino_arm_cpu_plugin.so"
-            } else {
-                "libopenvino_intel_cpu_plugin.so"
-            },
-        }))
-        .collect(),
-        "macos" => [
-            "libopenvino.",
-            "libopenvino_c.",
-            "libopenvino_ir_frontend.",
-            "libtbb.12",
-            "libtbbbind_2_5.",
-            "libhwloc.",
-        ]
+        .copied()
+        .enumerate()
+        .map(|(i, prefix)| OvLib {
+            prefix,
+            core: i == 0,
+        })
+        .collect();
+    libs.push(OvLib {
+        prefix: plugin,
+        core: false,
+    });
+    Some(libs)
+}
+
+/// The runtime name a shared library records for itself: ELF `SONAME`
+/// (`readelf -d`), or the Mach-O install name (`otool -D`). `None` when the
+/// file records none or the platform tool is unavailable.
+fn recorded_library_name(path: &Path, target_os: &str) -> Option<String> {
+    let out = match target_os {
+        "linux" => Command::new("readelf").arg("-d").arg(path).output(),
+        "macos" => Command::new("otool").arg("-D").arg(path).output(),
+        _ => return None,
+    }
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let name = match target_os {
+        "linux" => text
+            .lines()
+            .find_map(|line| line.split("(SONAME)").nth(1))
+            .and_then(|rest| rest.split('[').nth(1))
+            .and_then(|rest| rest.split(']').next())?
+            .trim(),
+        // otool -D prints the file path, then the install name.
+        "macos" => text.lines().nth(1)?.trim(),
+        _ => return None,
+    };
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn library_basename(raw: &str) -> &str {
+    raw.rsplit('/').next().unwrap_or(raw)
+}
+
+/// True when `path` is a symlink whose canonical target stays inside `src`
+/// and matches the same prefix — the archive-layout SONAME symlink.
+fn is_matching_symlink(path: &Path, prefix: &str, src: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(target) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    target.starts_with(src)
+        && target
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with(prefix))
+}
+
+/// Choose the file to vendor for `prefix`, most loader-correct first:
+/// 1. a file already named like its recorded SONAME/install name;
+/// 2. the shortest matching symlink (archive layouts name it after the SONAME);
+/// 3. the longest matching filename (the pip layout ships only the real file).
+fn pick_ov_file(available: &[String], prefix: &str, src: &Path, target_os: &str) -> Option<String> {
+    let mut hits: Vec<&String> = available.iter().filter(|f| f.starts_with(prefix)).collect();
+    hits.sort();
+    if let Some(name) = hits.iter().find(|f| {
+        recorded_library_name(&src.join(f.as_str()), target_os)
+            .as_deref()
+            .map(library_basename)
+            == Some(f.as_str())
+    }) {
+        return Some((*name).clone());
+    }
+    let mut links: Vec<&String> = hits
         .iter()
-        .map(|s| OvLib { prefix: s })
-        .chain(std::iter::once(OvLib {
-            prefix: if cpu_plugin == "openvino_arm_cpu_plugin" {
-                "libopenvino_arm_cpu_plugin.so"
-            } else {
-                "libopenvino_intel_cpu_plugin.so"
-            },
-        }))
-        .collect(),
-        other => panic!("openvino-backend: unsupported target OS {other:?}"),
+        .copied()
+        .filter(|f| is_matching_symlink(&src.join(f.as_str()), prefix, src))
+        .collect();
+    links.sort_by_key(|f| f.len());
+    if let Some(name) = links.first() {
+        return Some((*name).clone());
+    }
+    hits.sort_by_key(|f| std::cmp::Reverse(f.len()));
+    hits.first().map(|f| (*f).clone())
+}
+
+/// Remove stale staged runtime files from `OUT_DIR`: anything matching the
+/// vendored prefixes for this target, or `plugins.xml`, that is not in `keep`.
+fn prune_ov_staging(target_os: &str, keep: &[String]) {
+    let Some((common, plugins)) = ov_staging_names(target_os) else {
+        return;
+    };
+    let dest = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    let Ok(entries) = std::fs::read_dir(&dest) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let staged = name == "plugins.xml"
+            || common
+                .iter()
+                .chain(plugins.iter())
+                .any(|p| name.starts_with(p));
+        if staged && !keep.contains(&name) {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => println!("cargo:warning=openvino-backend: removed stale {name}"),
+                Err(e) => {
+                    println!("cargo:warning=openvino-backend: cannot remove stale {name}: {e}")
+                }
+            }
+        }
     }
 }
 
@@ -142,7 +277,7 @@ fn ov_lib_patterns(target_os: &str, target_arch: &str) -> Vec<OvLib> {
 fn stage_ov_libs(target_os: &str, target_arch: &str) {
     println!("cargo:rerun-if-env-changed=OV_LIB_DIR");
     let src = std::env::var("OV_LIB_DIR")
-        .map(std::path::PathBuf::from)
+        .map(PathBuf::from)
         .ok()
         .filter(|p| p.is_dir())
         .unwrap_or_else(|| {
@@ -151,24 +286,23 @@ fn stage_ov_libs(target_os: &str, target_arch: &str) {
                  (`pip install openvino==<OV_VERSION>`, then `<python>/site-packages/openvino/libs`)"
             )
         });
+    let src_canon = std::fs::canonicalize(&src).unwrap_or_else(|_| src.clone());
     let available: Vec<String> = std::fs::read_dir(&src)
         .unwrap_or_else(|e| panic!("openvino-backend: cannot list {}: {e}", src.display()))
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
-    let dest = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
-    std::fs::create_dir_all(&dest).expect("create OV staging dir");
-    // The staged CPU plugin filename, needed below for plugins.xml.
+    let patterns = ov_lib_patterns(target_os, target_arch)
+        .unwrap_or_else(|| panic!("openvino-backend: unsupported target OS {target_os:?}"));
+
+    // Resolve every filename before touching OUT_DIR: this set drives the
+    // stale-file pruning below, and a renamed file (SONAME) must be staged
+    // under the name the loader will look for.
+    let mut staged: Vec<(String, String)> = Vec::new();
     let mut staged_plugin: Option<String> = None;
-    for pat in ov_lib_patterns(target_os, target_arch) {
-        // Most-specific match wins (e.g. versioned `libopenvino.so.2641`
-        // over an unversioned symlink, when archives ship both).
-        let mut hits: Vec<&String> = available
-            .iter()
-            .filter(|f| *f == pat.prefix || f.starts_with(pat.prefix))
-            .collect();
-        hits.sort_by_key(|f| std::cmp::Reverse(f.len()));
-        let Some(name) = hits.into_iter().next() else {
+    let mut core_name: Option<String> = None;
+    for pat in &patterns {
+        let Some(source_name) = pick_ov_file(&available, pat.prefix, &src_canon, target_os) else {
             panic!(
                 "openvino-backend: nothing matching {:?} in OV_LIB_DIR={} (has: {}); \
                  expected the official OpenVINO runtime libs",
@@ -177,9 +311,28 @@ fn stage_ov_libs(target_os: &str, target_arch: &str) {
                 available.join(", ")
             );
         };
-        // Stage under the source filename, plugin included; pyproject's
-        // out-dir include packs this whole dir into the wheel.
-        let (from, to) = (src.join(name), dest.join(name));
+        let staged_name = recorded_library_name(&src.join(&source_name), target_os)
+            .map(|raw| library_basename(&raw).to_string())
+            .filter(|n| !n.contains(|c| c == '/' || c == '\\'))
+            .unwrap_or_else(|| source_name.clone());
+        if staged_name.contains("cpu_plugin") {
+            staged_plugin = Some(staged_name.clone());
+        }
+        if pat.core {
+            core_name = Some(staged_name.clone());
+        }
+        staged.push((source_name, staged_name));
+    }
+
+    let dest = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    std::fs::create_dir_all(&dest).expect("create OV staging dir");
+    let mut keep: Vec<String> = staged.iter().map(|(_, to)| to.clone()).collect();
+    keep.push("plugins.xml".to_string());
+    prune_ov_staging(target_os, &keep);
+
+    for (from_name, to_name) in &staged {
+        let from = src.join(from_name);
+        let to = dest.join(to_name);
         // Skip unchanged copies so rebuilds stay cheap.
         let fresh = to
             .metadata()
@@ -189,15 +342,129 @@ fn stage_ov_libs(target_os: &str, target_arch: &str) {
             std::fs::copy(&from, &to).unwrap_or_else(|e| {
                 panic!("openvino-backend: copy {} failed: {e}", from.display())
             });
-            println!("cargo:warning=openvino-backend: staged {name}");
+            println!("cargo:warning=openvino-backend: staged {to_name}");
         } else {
-            println!("cargo:warning=openvino-backend: reused {name}");
-        }
-        if name.contains("cpu_plugin") {
-            staged_plugin = Some(name.to_string());
+            println!("cargo:warning=openvino-backend: reused {to_name}");
         }
     }
     stage_plugins_xml(&dest, staged_plugin);
+
+    // Build-time proof that the vendored runtime is new enough for this code:
+    // `set_core_properties` calls the non-variadic `ov_core_set_properties`,
+    // which only exists from OpenVINO 2026.x.
+    if let Some(name) = &core_name {
+        verify_core_symbol(&dest.join(name), target_os);
+    }
+    if target_os == "macos" {
+        verify_macos_vendoring(&dest, &staged, target_os);
+    }
+}
+
+/// Fail the build if the staged core runtime does not export the
+/// non-variadic `ov_core_set_properties` entry point (OpenVINO 2026.x API).
+fn verify_core_symbol(path: &Path, target_os: &str) {
+    let (args, symbol): (&[&str], &str) = match target_os {
+        "linux" => (&["-D", "--defined-only"], "ov_core_set_properties"),
+        "macos" => (&["-gU"], "_ov_core_set_properties"),
+        // Windows: openvino-sys links the runtime's import lib at build time,
+        // which fails already when the symbol is absent.
+        _ => return,
+    };
+    let Ok(out) = Command::new("nm").args(args).arg(path).output() else {
+        println!(
+            "cargo:warning=openvino-backend: nm unavailable; cannot verify {symbol} in {}",
+            path.display()
+        );
+        return;
+    };
+    if !out.status.success() {
+        println!(
+            "cargo:warning=openvino-backend: nm failed on {}; skipping runtime symbol probe",
+            path.display()
+        );
+        return;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let found = text.lines().any(|line| {
+        line.split_whitespace()
+            .last()
+            .map(|sym| sym.split('@').next().unwrap_or(sym) == symbol)
+            .unwrap_or(false)
+    });
+    if !found {
+        panic!(
+            "openvino-backend: {} does not export {symbol}; the OV_LIB_DIR runtime predates \
+             OpenVINO 2026.x, which this build's memory-safe `set_core_properties` requires. \
+             Point OV_LIB_DIR at OpenVINO >= 2026.0 (CI pins 2026.4.1).",
+            path.display()
+        );
+    }
+    println!(
+        "cargo:warning=openvino-backend: verified {symbol} in {}",
+        path.display()
+    );
+}
+
+/// Verify the staged dylibs are relocatable: their own install names and
+/// every reference to a sibling vendored lib must be `@rpath/...` or
+/// `@loader_path/...`, never an absolute build-machine path or a bare
+/// filename (both break after wheel install). Signature/strip issues are left
+/// to the CI import test and its crash diagnostics.
+fn verify_macos_vendoring(dest: &Path, staged: &[(String, String)], target_os: &str) {
+    let Some((common, plugins)) = ov_staging_names(target_os) else {
+        return;
+    };
+    let is_ours = |name: &str| {
+        common
+            .iter()
+            .chain(plugins.iter())
+            .any(|p| name.starts_with(p))
+    };
+    let mut otool_missing = false;
+    for (_, staged_name) in staged {
+        let path = dest.join(staged_name);
+        if let Some(id) = recorded_library_name(&path, target_os) {
+            if id.starts_with('/') {
+                panic!(
+                    "openvino-backend: {} has absolute install name {id:?}; the vendored wheel \
+                     would not load after install",
+                    path.display()
+                );
+            }
+        }
+        match Command::new("otool").arg("-L").arg(&path).output() {
+            Ok(out) if out.status.success() => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                for line in text.lines().skip(1) {
+                    let dep = line.trim().split(" (").next().unwrap_or("").trim();
+                    if dep.is_empty() || !is_ours(library_basename(dep)) {
+                        continue;
+                    }
+                    if !(dep.starts_with("@rpath/") || dep.starts_with("@loader_path/")) {
+                        panic!(
+                            "openvino-backend: {} references {dep:?}; vendored sibling libs must \
+                             resolve via @rpath/@loader_path",
+                            path.display()
+                        );
+                    }
+                }
+            }
+            Ok(out) => println!(
+                "cargo:warning=openvino-backend: otool -L failed on {} (status {:?})",
+                path.display(),
+                out.status.code()
+            ),
+            Err(_) => {
+                if !otool_missing {
+                    otool_missing = true;
+                    println!(
+                        "cargo:warning=openvino-backend: otool unavailable; skipping macOS rpath \
+                         verification"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Write a minimal `plugins.xml` beside the staged libs registering the CPU

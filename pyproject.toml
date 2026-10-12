@@ -9,7 +9,7 @@ description = "Fast CPU OCR — PaddleOCR PP-OCRv6 tiny/small/medium in Rust, wi
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
-authors = [{ name = "cnmoro", email = "cnmoro@gmail.com" }]
+authors = [{ name = "phruut", email = "102803247+phruut@users.noreply.github.com" }]
 keywords = ["ocr", "paddleocr", "ppocr", "onnx", "onnxruntime", "rust", "cpu", "text-recognition"]
 classifiers = [
     "Programming Language :: Rust",

@@ -1,6 +1,9 @@
 //! Opt-in OpenVINO inference backend (`openvino-backend` cargo feature).
 //!
-//! Build requirements: OpenVINO native libs plus libclang for bindgen.
+//! Build requirements: OpenVINO native libs (>= 2026.0; CI pins 2026.4.1)
+//! plus libclang for bindgen. build.rs refuses to vendor a runtime that lacks
+//! the 2026 `ov_core_set_properties` C entry point, which `set_core_properties`
+//! below calls.
 //! Two knobs, different jobs:
 //!   PATH (or OV_INSTALL_DIR) — where openvino-sys finds libs to LINK
 //!     against at compile time;
@@ -121,7 +124,36 @@ fn set_core_properties(core: &Core, device: &str, props: &[(&str, String)]) -> R
     }
 }
 
+/// Minimum OpenVINO runtime this module supports. The bindings accept
+/// `>= 2025.1`, but `set_core_properties` calls the non-variadic
+/// `ov_core_set_properties` C entry point, which was added in 2026.x; the
+/// vendored wheel runtime and the CI pin are 2026.4.1. build.rs probes the
+/// vendored lib for the symbol; this guards runtime-linking/custom setups.
+const MIN_RUNTIME: (usize, usize) = (2026, 0);
+
+/// Error when the linked runtime is older than [`MIN_RUNTIME`].
+fn ensure_runtime_supported() -> Result<(), String> {
+    let version = openvino::version();
+    let mut parts = version.build_number.split(['.', '-']);
+    let (Some(year), Some(minor)) = (
+        parts.next().and_then(|p| p.parse::<usize>().ok()),
+        parts.next().and_then(|p| p.parse::<usize>().ok()),
+    ) else {
+        // Unrecognized version string: leave the check to the build probe.
+        return Ok(());
+    };
+    if (year, minor) < MIN_RUNTIME {
+        return Err(format!(
+            "OpenVINO runtime {} is older than the required {}.{} (this build calls \
+             ov_core_set_properties, which requires the 2026 API)",
+            version.build_number, MIN_RUNTIME.0, MIN_RUNTIME.1
+        ));
+    }
+    Ok(())
+}
+
 fn new_core(threads: usize, streams: Option<usize>) -> Result<Core, String> {
+    ensure_runtime_supported()?;
     let core = Core::new().map_err(|e| ov_err("Core::new", e))?;
     let mut props: Vec<(&str, String)> = vec![
         ("PERFORMANCE_HINT", "LATENCY".to_string()),

@@ -200,8 +200,8 @@ jobs:
         run: |
           python scripts/convert_ir.py "$OV_IR_DIR" tiny small
           python -m pip install dist/*.whl
-          echo "--- wheel contents (vendored runtime proof) ---"
-          unzip -l dist/*.whl | head -n 40 || true
+          echo "--- vendored runtime proof (fatal if incomplete) ---"
+          python scripts/check_wheel_runtime.py dist/*.whl
           python -c "import faster_paddle; assert faster_paddle.__backends__ == ['ov'], faster_paddle.__backends__; print('backends OK:', faster_paddle.__backends__, faster_paddle.__runtime_build__)"
           if ! python -m pytest tests -q > wheel-tests.log 2>&1; then
             cat wheel-tests.log
@@ -277,7 +277,11 @@ jobs:
           echo "OV_LIB_DIR=$OV_DIR" >> "$GITHUB_ENV"
           echo "LIBCLANG_PATH=$CLANG_DIR" >> "$GITHUB_ENV"
           # openvino-sys locates openvino.lib / openvino_c.lib via PATH on
-          # Windows; build.rs vendoring uses OV_LIB_DIR.
+          # Windows; build.rs vendoring uses OV_LIB_DIR. Save the PATH without
+          # OV_DIR so the test step can restore it: the wheel must prove it is
+          # self-contained, and pip's OV DLLs on PATH would mask a missing
+          # vendored DLL.
+          echo "PATH_BEFORE_OV=$PATH" >> "$GITHUB_ENV"
           echo "$OV_DIR" >> "$GITHUB_PATH"
           ls "$OV_DIR"
       - name: Rename distribution for the OV wheel
@@ -304,10 +308,13 @@ jobs:
           FASTER_PADDLE_MODEL_DIR: ${{ github.workspace }}/models
           OV_IR_DIR: ${{ runner.temp }}/ir-test
         run: |
+          # Drop the build-time OV_DIR PATH entry: the wheel vendors its own
+          # runtime, so the tests must pass without pip's OpenVINO DLLs.
+          export PATH="${PATH_BEFORE_OV:-$PATH}"
           python scripts/convert_ir.py "$OV_IR_DIR" tiny small
           python -m pip install dist/*.whl
-          echo "--- wheel contents (vendored runtime proof) ---"
-          unzip -l dist/*.whl | head -n 40 || true
+          echo "--- vendored runtime proof (fatal if incomplete) ---"
+          python scripts/check_wheel_runtime.py dist/*.whl
           python -c "import faster_paddle; assert faster_paddle.__backends__ == ['ov'], faster_paddle.__backends__; print('backends OK:', faster_paddle.__backends__, faster_paddle.__runtime_build__)"
           if ! python -m pytest tests -q > wheel-tests.log 2>&1; then
             cat wheel-tests.log
@@ -424,8 +431,8 @@ jobs:
           unset DYLD_LIBRARY_PATH
           python scripts/convert_ir.py "$OV_IR_DIR" tiny small
           python -m pip install dist/*.whl
-          echo "--- wheel contents (vendored runtime proof) ---"
-          unzip -l dist/*.whl | head -n 40 || true
+          echo "--- vendored runtime proof (fatal if incomplete) ---"
+          python scripts/check_wheel_runtime.py dist/*.whl
           python -c "import faster_paddle; assert faster_paddle.__backends__ == ['ov'], faster_paddle.__backends__; print('backends OK:', faster_paddle.__backends__, faster_paddle.__runtime_build__)"
           if ! python -m pytest tests -q > wheel-tests.log 2>&1; then
             cat wheel-tests.log

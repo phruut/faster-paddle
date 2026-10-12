@@ -56,12 +56,16 @@ serde_json = "1"
 # runtime download of sizes that aren't bundled; rustls to stay openssl-free
 ureq = { version = "2", default-features = false, features = ["tls"] }
 dirs = "5"
-# see `openvino-backend` feature above; opt-in only
-openvino = { version = "0.11", optional = true }
+# see `openvino-backend` feature above; opt-in only. Pinned exactly:
+# `set_core_properties` in src/ov_backend.rs recovers `Core`'s raw pointer
+# with `transmute_copy`, which relies on 0.11.1's single-pointer layout; a
+# semver-compatible bump could change that silently.
+openvino = { version = "=0.11.1", optional = true }
 # `openvino-sys` is a transitive dep of `openvino`, but src/ov_backend.rs also
-# calls `ov_core_set_property` directly (see set_core_property) because the
-# crate's binding declares the variadic C function with fixed arguments.
-openvino-sys = { version = "0.11", optional = true }
+# calls `ov_core_set_properties` directly (see `set_core_properties`) because
+# the crate's binding declares the variadic `ov_core_set_property` with fixed
+# arguments.
+openvino-sys = { version = "=0.11.1", optional = true }
 
 [profile.release]
 opt-level = 3
