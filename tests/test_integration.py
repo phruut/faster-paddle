@@ -250,6 +250,26 @@ def test_short_labels_with_model_specific_padding():
         assert Counter(eng.ocr(data)["text"].split()) == Counter(labels.split())
 
 
+def test_ocr_batch_text_score_keeps_pages_aligned():
+    """Regression: when `text_score` filters reads, every page of `ocr_batch`
+    must still receive only its own boxes. The first page has filtered crops,
+    so a filtered recognition stream would push the label page's boxes onto it
+    (and strip them from the label page)."""
+    doc = _small()
+    labels = open(os.path.join(HERE, "fixtures", "labels.png"), "rb").read()
+    eng = faster_paddle.OcrEngine(model_size="tiny", threads=2, text_score=0.5)
+
+    texts = lambda r: [b["text"] for b in r["bounds"].values()]
+    doc_single, label_single = texts(eng.ocr(doc)), texts(eng.ocr(labels))
+    assert doc_single and label_single
+    label_only = set(label_single) - set(doc_single)
+    assert label_only, "fixtures no longer have page-distinct tokens"
+
+    batch_doc, batch_labels = eng.ocr_batch([doc, labels])
+    assert not (label_only & set(texts(batch_doc))), "document page stole label-page boxes"
+    assert len(texts(batch_labels)) == len(label_single), "label page lost boxes to the document page"
+
+
 @requires_ort
 def test_sparse_wide_jobs_match_batch_text_and_boxes():
     data = open(os.path.join(HERE, "fixtures", "long-line.png"), "rb").read()
@@ -511,19 +531,31 @@ def test_cache_dir_arg_and_env_precedence(tmp_path):
     tiny.mkdir(parents=True)
     shutil.copy(os.path.join(MODELS_DIR, "tiny", "det.onnx"), tiny / "det.onnx")
     shutil.copy(os.path.join(MODELS_DIR, "tiny", "rec.onnx"), tiny / "rec.onnx")
+    # An explicit empty model_dir keeps FASTER_PADDLE_MODEL_DIR (set by the CI
+    # wheel jobs) from shadowing the cache and resolves to a local miss; a
+    # code-only wheel must then report 'cached'. A bundled-all wheel resolves
+    # its bundled weights before the cache and legitimately reports 'bundled'.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    expected_sources = ("cached", "bundled")
+
     eng = faster_paddle.OcrEngine(
-        model_size="tiny", threads=2, model_dir=MODELS_DIR, cache_dir=str(cache)
+        model_size="tiny", threads=2, model_dir=str(empty), cache_dir=str(cache)
     )
     assert eng.config["cache_dir"] == str(cache)
+    assert eng.config["det_source"] in expected_sources
+    assert eng.config["rec_source"] == eng.config["det_source"]
 
     before = os.environ.get("FASTER_PADDLE_CACHE_DIR")
     with patch.dict(os.environ, {"FASTER_PADDLE_CACHE_DIR": str(cache)}):
-        eng = faster_paddle.OcrEngine(model_size="tiny", threads=2)
+        eng = faster_paddle.OcrEngine(model_size="tiny", threads=2, model_dir=str(empty))
         assert eng.config["cache_dir"] == str(cache)
-        assert eng.config["det_source"] == "cached"
+        assert eng.config["det_source"] in expected_sources
         # explicit arg beats the env var
         other = tmp_path / "other"
-        eng = faster_paddle.OcrEngine(model_size="tiny", threads=2, cache_dir=str(other))
+        eng = faster_paddle.OcrEngine(
+            model_size="tiny", threads=2, model_dir=str(empty), cache_dir=str(other)
+        )
         assert eng.config["cache_dir"] == str(other)
     assert os.environ.get("FASTER_PADDLE_CACHE_DIR") == before
 

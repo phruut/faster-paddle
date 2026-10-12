@@ -308,7 +308,11 @@ impl Engine {
         let workers = Arc::clone(&self.workers);
         workers.install(|| {
             let (crops, boxes) = self.detect_crops(img)?;
-            self.recognize(&crops, &boxes)
+            Ok(self
+                .recognize(&crops, &boxes)?
+                .into_iter()
+                .flatten()
+                .collect())
         })
     }
 
@@ -324,11 +328,8 @@ impl Engine {
                 crops.extend(cs);
                 boxes.extend(bs);
             }
-            let mut recognized = self.recognize(&crops, &boxes)?.into_iter();
-            Ok(counts
-                .into_iter()
-                .map(|n| recognized.by_ref().take(n).collect())
-                .collect())
+            let recognized = self.recognize(&crops, &boxes)?;
+            Ok(split_page_results(recognized, &counts))
         })
     }
 
@@ -460,25 +461,28 @@ impl Engine {
         &mut self,
         crops: &[ImageRgb],
         kept_boxes: &[[cv::Pt; 4]],
-    ) -> ort::Result<Vec<OcrResult>> {
+    ) -> ort::Result<Vec<Option<OcrResult>>> {
         let texts = self.recognize_texts(crops)?;
-        // drop low-conf reads when text_score > 0, else keep all
-        let mut out = Vec::with_capacity(crops.len());
+        // drop low-conf reads when text_score > 0, else keep all; `None` keeps
+        // every entry aligned with its crop so pages can be split off later
         let thresh = self.text_score;
-        for ((t, sc), q) in texts.into_iter().zip(kept_boxes) {
-            if sc < thresh {
-                continue;
-            }
-            if thresh > 0.0 && t.trim().is_empty() {
-                continue;
-            }
-            out.push(OcrResult {
-                text: t,
-                score: sc,
-                box4: quad_to_box4(q),
-            });
-        }
-        Ok(out)
+        Ok(texts
+            .into_iter()
+            .zip(kept_boxes)
+            .map(|((t, sc), q)| {
+                if sc < thresh {
+                    return None;
+                }
+                if thresh > 0.0 && t.trim().is_empty() {
+                    return None;
+                }
+                Some(OcrResult {
+                    text: t,
+                    score: sc,
+                    box4: quad_to_box4(q),
+                })
+            })
+            .collect())
     }
 
     fn recognize_texts(&mut self, crops: &[ImageRgb]) -> ort::Result<Vec<(String, f32)>> {
@@ -658,6 +662,22 @@ pub(crate) fn ctc_decode(chars: &[String], logits: &[f32], t: usize, cls: usize)
         0.0
     };
     (s, score)
+}
+
+/// Split an aligned recognition stream (one entry per crop, `None` for reads
+/// dropped by the `text_score` filter) into per-image result lists using the
+/// pre-filter crop count of each image. Entries must be consumed in image
+/// order, so a filtered read can never shift a later page's boxes onto an
+/// earlier one.
+pub(crate) fn split_page_results(
+    recognized: Vec<Option<OcrResult>>,
+    counts: &[usize],
+) -> Vec<Vec<OcrResult>> {
+    let mut items = recognized.into_iter();
+    counts
+        .iter()
+        .map(|&n| items.by_ref().take(n).flatten().collect())
+        .collect()
 }
 
 /// Group `order` (crop indices, pre-sorted by rec width ascending) into batches
@@ -1243,6 +1263,34 @@ mod tests {
         seen.sort();
         assert_eq!(seen, (0..37).collect::<Vec<_>>());
         assert!(b.iter().all(|batch| batch.len() <= 8));
+    }
+
+    #[test]
+    fn filtered_reads_keep_page_alignment() {
+        let kept = |text: &str| {
+            Some(OcrResult {
+                text: text.to_string(),
+                score: 1.0,
+                box4: [0, 0, 1, 1],
+            })
+        };
+        // page 1: two of three crops filtered; page 2: first crop filtered
+        let pages = split_page_results(
+            vec![kept("a0"), None, None, None, kept("b1"), kept("b2")],
+            &[3, 3],
+        );
+        assert_eq!(
+            pages[0].iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            ["a0"]
+        );
+        assert_eq!(
+            pages[1].iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            ["b1", "b2"]
+        );
+        // a page whose reads are all filtered must not consume the next page's entries
+        let pages = split_page_results(vec![None, None, kept("b0")], &[2, 1]);
+        assert!(pages[0].is_empty());
+        assert_eq!(pages[1].len(), 1);
     }
 
     #[test]

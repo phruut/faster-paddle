@@ -42,6 +42,34 @@ jobs:
       - run: python -m pip install dist-test/*.whl
       - run: python -m pytest tests -q
 
+  # The runtime downloads assets from `releases/download/v{VERSION}` where
+  # VERSION is the compiled `CARGO_PKG_VERSION`, so a tag that disagrees with
+  # the manifests would release/validate the wrong artifacts (see
+  # download-check). Also keeps Cargo.toml and pyproject.toml in sync on PRs.
+  version-check:
+    name: Manifest versions agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check Cargo.toml, pyproject.toml and (on tags) the git tag
+        run: |
+          cargo_version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          pyproject_version=$(grep -m1 '^version' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "cargo=$cargo_version pyproject=$pyproject_version ref=$GITHUB_REF"
+          if [ "$cargo_version" != "$pyproject_version" ]; then
+            echo "::error::Cargo.toml ($cargo_version) and pyproject.toml ($pyproject_version) disagree"
+            exit 1
+          fi
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              tag_version=${GITHUB_REF_NAME#v}
+              if [ "$tag_version" != "$cargo_version" ]; then
+                echo "::error::tag $GITHUB_REF_NAME does not match manifest version $cargo_version"
+                exit 1
+              fi
+              ;;
+          esac
+
   linux:
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -449,6 +477,7 @@ jobs:
     name: Upload model weights to release
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    needs: version-check
     permissions:
       contents: write
     steps:
@@ -496,7 +525,7 @@ jobs:
     name: Check on-demand model download
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, model-assets]
+    needs: [version-check, linux, model-assets]
     steps:
       - uses: actions/download-artifact@v7
         with:
@@ -526,7 +555,7 @@ jobs:
     name: Check on-demand IR download (OV wheel)
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux-ov, model-assets]
+    needs: [version-check, linux-ov, model-assets]
     steps:
       - uses: actions/download-artifact@v7
         with:
@@ -565,7 +594,7 @@ jobs:
     name: Attach wheels to release
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [tests, linux, windows, macos, sdist, download-check, linux-ov, windows-ov, macos-ov, ov-download-check]
+    needs: [version-check, tests, linux, windows, macos, sdist, download-check, linux-ov, windows-ov, macos-ov, ov-download-check]
     permissions:
       contents: write
     steps:

@@ -30,8 +30,8 @@
 use crate::cv;
 use crate::ocr::{
     crop_quad, ctc_decode, db_postprocess, det_resize_dims_with_min, plan_rec_batches,
-    quad_to_box4, rec_width, resize_to_tensor, sort_boxes, ImageRgb, OcrResult, DET_MEAN,
-    DET_STD, LIMIT_SIDE_LEN, MAX_SIDE_LIMIT, REC_H, REC_MAX_W,
+    quad_to_box4, rec_width, resize_to_tensor, sort_boxes, split_page_results, ImageRgb,
+    OcrResult, DET_MEAN, DET_STD, LIMIT_SIDE_LEN, MAX_SIDE_LIMIT, REC_H, REC_MAX_W,
 };
 use openvino::{
     CompiledModel, Core, DeviceType, ElementType, InferRequest, PartialShape, Shape, Tensor,
@@ -356,7 +356,11 @@ impl OvEngine {
         let workers = Arc::clone(&self.workers);
         workers.install(|| {
             let (crops, boxes) = self.detect_crops(img)?;
-            self.recognize(&crops, &boxes)
+            Ok(self
+                .recognize(&crops, &boxes)?
+                .into_iter()
+                .flatten()
+                .collect())
         })
     }
 
@@ -372,11 +376,8 @@ impl OvEngine {
                 crops.extend(cs);
                 boxes.extend(bs);
             }
-            let mut recognized = self.recognize(&crops, &boxes)?.into_iter();
-            Ok(counts
-                .into_iter()
-                .map(|n| recognized.by_ref().take(n).collect())
-                .collect())
+            let recognized = self.recognize(&crops, &boxes)?;
+            Ok(split_page_results(recognized, &counts))
         })
     }
 
@@ -531,24 +532,26 @@ impl OvEngine {
         &mut self,
         crops: &[ImageRgb],
         kept_boxes: &[[cv::Pt; 4]],
-    ) -> Result<Vec<OcrResult>, String> {
+    ) -> Result<Vec<Option<OcrResult>>, String> {
         let texts = self.recognize_texts(crops)?;
-        let mut out = Vec::with_capacity(crops.len());
         let thresh = self.text_score;
-        for ((t, sc), q) in texts.into_iter().zip(kept_boxes) {
-            if sc < thresh {
-                continue;
-            }
-            if thresh > 0.0 && t.trim().is_empty() {
-                continue;
-            }
-            out.push(OcrResult {
-                text: t,
-                score: sc,
-                box4: quad_to_box4(q),
-            });
-        }
-        Ok(out)
+        Ok(texts
+            .into_iter()
+            .zip(kept_boxes)
+            .map(|((t, sc), q)| {
+                if sc < thresh {
+                    return None;
+                }
+                if thresh > 0.0 && t.trim().is_empty() {
+                    return None;
+                }
+                Some(OcrResult {
+                    text: t,
+                    score: sc,
+                    box4: quad_to_box4(q),
+                })
+            })
+            .collect())
     }
 
     fn recognize_texts(&mut self, crops: &[ImageRgb]) -> Result<Vec<(String, f32)>, String> {
