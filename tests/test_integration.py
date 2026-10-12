@@ -500,6 +500,34 @@ def test_model_dir_env_var_and_arg_precedence():
     assert expected
 
 
+@requires_ort
+def test_cache_dir_arg_and_env_precedence(tmp_path):
+    import shutil
+    from unittest.mock import patch
+
+    # A custom cache hit needs no network: seed it with the repo weights.
+    cache = tmp_path / "cache"
+    tiny = cache / "tiny"
+    tiny.mkdir(parents=True)
+    shutil.copy(os.path.join(MODELS_DIR, "tiny", "det.onnx"), tiny / "det.onnx")
+    shutil.copy(os.path.join(MODELS_DIR, "tiny", "rec.onnx"), tiny / "rec.onnx")
+    eng = faster_paddle.OcrEngine(
+        model_size="tiny", threads=2, model_dir=MODELS_DIR, cache_dir=str(cache)
+    )
+    assert eng.config["cache_dir"] == str(cache)
+
+    before = os.environ.get("FASTER_PADDLE_CACHE_DIR")
+    with patch.dict(os.environ, {"FASTER_PADDLE_CACHE_DIR": str(cache)}):
+        eng = faster_paddle.OcrEngine(model_size="tiny", threads=2)
+        assert eng.config["cache_dir"] == str(cache)
+        assert eng.config["det_source"] == "cached"
+        # explicit arg beats the env var
+        other = tmp_path / "other"
+        eng = faster_paddle.OcrEngine(model_size="tiny", threads=2, cache_dir=str(other))
+        assert eng.config["cache_dir"] == str(other)
+    assert os.environ.get("FASTER_PADDLE_CACHE_DIR") == before
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

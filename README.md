@@ -121,8 +121,10 @@ variant of the text (see [below](#text-vs-structured_text)).
 
 A size that isn't built into your wheel is downloaded once on first use (that
 one time needs network) and cached under your user cache dir
-(`.../faster_paddle/v<VERSION>/{tiny,small,medium}/`). Point the engine at
-local weights to stay fully offline:
+(`.../faster_paddle/v<VERSION>/{tiny,small,medium}/`). Override the cache root
+with `cache_dir` (or `FASTER_PADDLE_CACHE_DIR`); an override stores
+`{cache_dir}/{tiny,small,medium}/` unversioned so upgrades reuse the files.
+Point the engine at local weights to stay fully offline:
 
 ```python
 engine = OcrEngine(model_size="tiny", model_dir="/path/to/models")
@@ -132,8 +134,8 @@ engine = OcrEngine(model_size="tiny", model_dir="/path/to/models")
 Layout mirrors this repo: `{model_dir}/{tiny,small,medium}/{det.onnx,rec.onnx}`,
 plus an optional `char_dict.json` per size for custom recognizers. Local files
 beat bundled, cached, and downloaded weights. `engine.config` reports
-`det_source` / `rec_source` (`local`, `bundled`, `cached`, `downloaded`) and
-the resolved `model_dir`.
+`det_source` / `rec_source` (`local`, `bundled`, `cached`, `downloaded`),
+the resolved `model_dir`, and the resolved `cache_dir`.
 
 To embed weights instead of downloading, build from source with cargo
 features (`bundled-tiny`, `bundled-small`, `bundled-medium`, `bundled-all`;

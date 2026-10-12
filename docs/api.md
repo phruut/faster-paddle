@@ -42,7 +42,7 @@ details and the execution order are in
 OcrEngine(
     model_size="tiny", threads=None, rec_batch=None, det_max_side=None,
     *,
-    det_model_size=None, rec_model_size=None, model_dir=None,
+    det_model_size=None, rec_model_size=None, model_dir=None, cache_dir=None,
     det_min_side=None, rec_min_width=None,
     det_thresh=None, det_box_thresh=None, det_unclip_ratio=None,
     det_max_candidates=None, text_score=None, det_use_dilation=None,
@@ -59,6 +59,7 @@ OcrEngine(
 | `det_model_size` | `model_size` | Detection model size. |
 | `rec_model_size` | `model_size` | Recognition model size. Mixing sizes (e.g. `OcrEngine("tiny", rec_model_size="small")`) loads a fast detector with a more accurate recognizer in one engine. |
 | `model_dir` | `FASTER_PADDLE_MODEL_DIR` | Directory with local weights. Each needed size falls back to bundled weights (if built in), then cache, then a one-time download. Local files win, so a code-only build stays fully offline. |
+| `cache_dir` | `FASTER_PADDLE_CACHE_DIR` | Download cache root (`{cache_dir}/{size}/`, unversioned). Defaults to the OS cache (`.../faster_paddle/v<VERSION>`). |
 | `det_min_side` | `736` | Minimum detector short side. Set `0` to disable minimum-side upscaling. Dimensions are still rounded to multiples of 32. |
 | `rec_min_width` | 64 tiny, 96 small, 320 medium | Recognition padding floor. Set `320` for the reference padding behavior. Shorter padding changes context and can change text/confidence; validate your languages and documents when migrating. Valid range 64-3200. |
 | `det_thresh` | `0.2` | Detection probability-map threshold. |
@@ -98,6 +99,7 @@ autotuning; benchmark other CPU architectures with
 | `OCR_APPROX_GELU` | approximate GELU. Stays off: its measured end-to-end benefit was inconsistent and it changed a detection. |
 | `OCR_DEBUG` | `[dbg]` timing lines on stderr |
 | `FASTER_PADDLE_MODEL_DIR` | default `model_dir` |
+| `FASTER_PADDLE_CACHE_DIR` | default `cache_dir` |
 | `FASTER_PADDLE_RELEASE_BASE` | base URL for model downloads (local mirror) |
 | `OV_IR_DIR` | fallback-free IR weight directory for `backend="ov"` |
 
@@ -124,7 +126,7 @@ layout can overlap. Independent engines have independent CPU budgets, so set
 input limits, the detection knob values in effect, `backend` (plus
 `ov_runtime` on the OpenVINO wheel), `det_model_size`/`rec_model_size`,
 `det_source`/`rec_source` (`local`, `bundled`, `cached`, `downloaded`), and
-the resolved `model_dir`. Useful for diagnostics and reproducible benchmarks.
+the resolved `model_dir`/`cache_dir`. Useful for diagnostics and reproducible benchmarks.
 
 Module-level: `faster_paddle.__backends__` lists the compiled runtimes and
 `faster_paddle.__runtime_build__` the linked runtime version.

@@ -304,6 +304,7 @@ fn rec_asset(size: &str) -> &'static str {
 fn resolve_det(
     size: &str,
     model_dir: Option<&std::path::Path>,
+    cache_root: &std::path::Path,
 ) -> PyResult<(Cow<'static, [u8]>, f32, &'static str)> {
     check_size(size)?;
     let thresh = if size == "tiny" { 0.40 } else { 0.45 };
@@ -313,7 +314,7 @@ fn resolve_det(
     if let Some(bytes) = bundled_det(size) {
         return Ok((Cow::Borrowed(bytes), thresh, "bundled"));
     }
-    let (bytes, source) = model_bytes(size, "det.onnx", det_asset(size))?;
+    let (bytes, source) = model_bytes(size, "det.onnx", det_asset(size), cache_root)?;
     Ok((Cow::Owned(bytes), thresh, source))
 }
 
@@ -321,6 +322,7 @@ fn resolve_det(
 fn resolve_rec(
     size: &str,
     model_dir: Option<&std::path::Path>,
+    cache_root: &std::path::Path,
 ) -> PyResult<(Cow<'static, [u8]>, Vec<String>, &'static str)> {
     check_size(size)?;
     let dict = match local_dict(model_dir, size) {
@@ -333,7 +335,7 @@ fn resolve_rec(
     if let Some(bytes) = bundled_rec(size) {
         return Ok((Cow::Borrowed(bytes), dict, "bundled"));
     }
-    let (bytes, source) = model_bytes(size, "rec.onnx", rec_asset(size))?;
+    let (bytes, source) = model_bytes(size, "rec.onnx", rec_asset(size), cache_root)?;
     Ok((Cow::Owned(bytes), dict, source))
 }
 
@@ -347,26 +349,46 @@ fn release_base() -> String {
         .unwrap_or_else(|| RELEASE_BASE.to_string())
 }
 
-/// Per-size cache directory shared by ONNX and IR weights.
-fn cache_dir_for(size: &str) -> PyResult<std::path::PathBuf> {
+/// Cache root override: constructor arg wins, else FASTER_PADDLE_CACHE_DIR.
+/// `None` means the default OS cache root.
+fn resolve_cache_dir(explicit: Option<&str>) -> Option<std::path::PathBuf> {
+    let raw = explicit
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var("FASTER_PADDLE_CACHE_DIR").ok())
+        .filter(|s| !s.is_empty())?;
+    Some(std::path::PathBuf::from(raw))
+}
+
+/// Cache root shared by ONNX and IR weights. An override is used as-is
+/// (unversioned: `{root}/{size}/`); otherwise the default versioned OS
+/// cache root (`.../faster_paddle/v<VERSION>`) applies.
+fn cache_root(custom: Option<&std::path::Path>) -> PyResult<std::path::PathBuf> {
+    if let Some(p) = custom {
+        return Ok(p.to_path_buf());
+    }
     dirs::cache_dir()
         .ok_or_else(|| {
-            PyRuntimeError::new_err(format!(
-                "cannot determine a cache directory for {size} models"
-            ))
+            PyRuntimeError::new_err("cannot determine a cache directory for models")
         })
-        .map(|d| {
-            d.join("faster_paddle")
-                .join(format!("v{VERSION}"))
-                .join(size)
-        })
+        .map(|d| d.join("faster_paddle").join(format!("v{VERSION}")))
+}
+
+/// Per-size cache directory under `root`.
+fn cache_dir_for(size: &str, root: &std::path::Path) -> std::path::PathBuf {
+    root.join(size)
 }
 
 /// Cache hit or one-time download of a non-bundled ONNX file. Returns the
 /// bytes and whether they were `cached` or `downloaded`.
 #[cfg(feature = "ort-backend")]
-fn model_bytes(size: &str, filename: &str, asset: &str) -> PyResult<(Vec<u8>, &'static str)> {
-    let cache = cache_dir_for(size)?;
+fn model_bytes(
+    size: &str,
+    filename: &str,
+    asset: &str,
+    cache_root: &std::path::Path,
+) -> PyResult<(Vec<u8>, &'static str)> {
+    let cache = cache_dir_for(size, cache_root);
     let path = cache.join(filename);
     if let Ok(bytes) = std::fs::read(&path) {
         if bytes.len() > 1024 {
@@ -692,6 +714,7 @@ fn new_engine(
     det_model_size: Option<&str>,
     rec_model_size: Option<&str>,
     model_dir: Option<&str>,
+    cache_dir: Option<&str>,
     threads: Option<usize>,
     rec_batch: Option<usize>,
     det_max_side: Option<i64>,
@@ -703,7 +726,13 @@ fn new_engine(
     det_max_candidates: Option<usize>,
     text_score: Option<f32>,
     det_use_dilation: Option<bool>,
-) -> PyResult<(BackendEngine, &'static str, &'static str, Option<String>)> {
+) -> PyResult<(
+    BackendEngine,
+    &'static str,
+    &'static str,
+    Option<String>,
+    String,
+)> {
     if threads == Some(0) || rec_batch == Some(0) {
         return Err(PyValueError::new_err(
             "threads and rec_batch must be positive",
@@ -770,6 +799,7 @@ fn new_engine(
     let det_size = det_model_size.unwrap_or(model_size);
     let rec_size = rec_model_size.unwrap_or(model_size);
     let dir = resolve_model_dir(model_dir);
+    let cache = cache_root(resolve_cache_dir(cache_dir).as_deref())?;
     let det_t = env_usize("OCR_DET_THREADS").unwrap_or(t.min(8)).clamp(1, t);
     let det_max = det_max_side.unwrap_or(ocr::DEFAULT_DET_MAX_SIDE);
     let pool = env_usize("REC_POOL")
@@ -799,6 +829,7 @@ fn new_engine(
             det_size,
             rec_size,
             dir.as_deref(),
+            cache.as_path(),
             t,
             det_t,
             pool,
@@ -825,8 +856,10 @@ fn new_engine(
     ));
     #[cfg(feature = "ort-backend")]
     {
-        let (det_bytes, box_default, det_source) = resolve_det(det_size, dir.as_deref())?;
-        let (rec_bytes, dict, rec_source) = resolve_rec(rec_size, dir.as_deref())?;
+        let (det_bytes, box_default, det_source) =
+            resolve_det(det_size, dir.as_deref(), cache.as_path())?;
+        let (rec_bytes, dict, rec_source) =
+            resolve_rec(rec_size, dir.as_deref(), cache.as_path())?;
         let rb = rec_batch.unwrap_or(ocr::DEFAULT_REC_BATCH);
         let det_box_thresh = det_box_thresh
             .or_else(|| env_float("OCR_DET_BOX_THRESH").map(|v| v as f32))
@@ -859,7 +892,8 @@ fn new_engine(
         );
         engine.set_input_limits(det_min_side, Some(width));
         let dir_str = dir.map(|p| p.to_string_lossy().into_owned());
-        Ok((engine, det_source, rec_source, dir_str))
+        let cache_str = cache.to_string_lossy().into_owned();
+        Ok((engine, det_source, rec_source, dir_str, cache_str))
     }
 }
 
@@ -872,6 +906,7 @@ fn new_ov_engine(
     det_size: &str,
     rec_size: &str,
     model_dir: Option<&std::path::Path>,
+    cache_root: &std::path::Path,
     threads: usize,
     det_threads: usize,
     pool: usize,
@@ -884,7 +919,13 @@ fn new_ov_engine(
     det_use_dilation: bool,
     det_min_side: Option<i64>,
     rec_min_width: usize,
-) -> PyResult<(BackendEngine, &'static str, &'static str, Option<String>)> {
+) -> PyResult<(
+    BackendEngine,
+    &'static str,
+    &'static str,
+    Option<String>,
+    String,
+)> {
     check_size(det_size)?;
     check_size(rec_size)?;
     // Same per-size box default as the ORT path (`resolve_det`).
@@ -911,10 +952,14 @@ fn new_ov_engine(
     };
     let (det_xml_asset, det_bin_asset) = ir_det_assets(det_size);
     let (rec_xml_asset, rec_bin_asset) = ir_rec_assets(rec_size);
-    let (det_xml, det_src) = ir_file_resolved(ir_dir.as_deref(), det_size, "det.xml", det_xml_asset)?;
-    let (det_bin, _) = ir_file_resolved(ir_dir.as_deref(), det_size, "det.bin", det_bin_asset)?;
-    let (rec_xml, rec_src) = ir_file_resolved(ir_dir.as_deref(), rec_size, "rec.xml", rec_xml_asset)?;
-    let (rec_bin, _) = ir_file_resolved(ir_dir.as_deref(), rec_size, "rec.bin", rec_bin_asset)?;
+    let (det_xml, det_src) =
+        ir_file_resolved(ir_dir.as_deref(), det_size, "det.xml", det_xml_asset, cache_root)?;
+    let (det_bin, _) =
+        ir_file_resolved(ir_dir.as_deref(), det_size, "det.bin", det_bin_asset, cache_root)?;
+    let (rec_xml, rec_src) =
+        ir_file_resolved(ir_dir.as_deref(), rec_size, "rec.xml", rec_xml_asset, cache_root)?;
+    let (rec_bin, _) =
+        ir_file_resolved(ir_dir.as_deref(), rec_size, "rec.bin", rec_bin_asset, cache_root)?;
     let mut engine = BackendEngine::Ov(
         ov_backend::OvEngine::from_files(
             det_size,
@@ -939,7 +984,8 @@ fn new_ov_engine(
     );
     engine.set_input_limits(det_min_side, Some(rec_min_width));
     let dir_str = ir_dir.map(|d| d.to_string_lossy().into_owned());
-    Ok((engine, det_src, rec_src, dir_str))
+    let cache_str = cache_root.to_string_lossy().into_owned();
+    Ok((engine, det_src, rec_src, dir_str, cache_str))
 }
 
 /// IR release asset names mirror the ONNX ones, with IR extensions. Attached
@@ -985,13 +1031,14 @@ fn ir_file_resolved(
     size: &str,
     filename: &str,
     asset: &str,
+    cache_root: &std::path::Path,
 ) -> PyResult<(std::path::PathBuf, &'static str)> {
     if let Some(path) = dir.map(|d| d.join(size).join(filename)) {
         if path.is_file() {
             return Ok((path, "local"));
         }
     }
-    let cache = cache_dir_for(size)?;
+    let cache = cache_dir_for(size, cache_root);
     let path = cache.join(filename);
     if let Ok(bytes) = std::fs::read(&path) {
         if bytes.len() > 1024 {
@@ -1167,6 +1214,7 @@ struct OcrEngine {
     det_source: &'static str,
     rec_source: &'static str,
     model_dir: Option<String>,
+    cache_dir: String,
 }
 
 #[pymethods]
@@ -1184,6 +1232,10 @@ impl OcrEngine {
     ///         optional `char_dict.json` per size). Falls back to
     ///         `FASTER_PADDLE_MODEL_DIR`. Local files beat bundled, cached, and
     ///         downloaded weights, so a code-only build stays fully offline.
+    ///     cache_dir: optional download cache root (`{cache_dir}/{size}/`).
+    ///         Falls back to `FASTER_PADDLE_CACHE_DIR`, else the OS cache
+    ///         (`.../faster_paddle/v<VERSION>`). An override is unversioned so
+    ///         upgrades reuse the same files.
     ///     threads: total CPU budget; defaults to available physical cores,
     ///         respecting affinity and container limits.
     ///     rec_batch: actual recognition batch cap (default 1).
@@ -1204,7 +1256,7 @@ impl OcrEngine {
     ///         `det.bin`, `rec.xml`, `rec.bin` in `OV_IR_DIR` or `model_dir`);
     ///         its `rec_batch` is always singleton regardless of the argument.
     #[new]
-    #[pyo3(signature = (model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_model_size=None, rec_model_size=None, model_dir=None, det_min_side=None, rec_min_width=None, det_thresh=None, det_box_thresh=None, det_unclip_ratio=None, det_max_candidates=None, text_score=None, det_use_dilation=None, backend=None))]
+    #[pyo3(signature = (model_size="tiny", threads=None, rec_batch=None, det_max_side=None, *, det_model_size=None, rec_model_size=None, model_dir=None, cache_dir=None, det_min_side=None, rec_min_width=None, det_thresh=None, det_box_thresh=None, det_unclip_ratio=None, det_max_candidates=None, text_score=None, det_use_dilation=None, backend=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -1215,6 +1267,7 @@ impl OcrEngine {
         det_model_size: Option<&str>,
         rec_model_size: Option<&str>,
         model_dir: Option<&str>,
+        cache_dir: Option<&str>,
         det_min_side: Option<i64>,
         rec_min_width: Option<usize>,
         det_thresh: Option<f32>,
@@ -1239,32 +1292,36 @@ impl OcrEngine {
         let det_size = det_model_size.map(str::to_string);
         let rec_size = rec_model_size.map(str::to_string);
         let dir = model_dir.map(str::to_string);
-        let (engine, det_source, rec_source, resolved_dir) = py.allow_threads(|| {
-            new_engine(
-                backend,
-                &size,
-                det_size.as_deref(),
-                rec_size.as_deref(),
-                dir.as_deref(),
-                threads,
-                rec_batch,
-                det_max_side,
-                det_min_side,
-                rec_min_width,
-                det_thresh,
-                det_box_thresh,
-                det_unclip_ratio,
-                det_max_candidates,
-                text_score,
-                det_use_dilation,
-            )
-        })?;
+        let cache = cache_dir.map(str::to_string);
+        let (engine, det_source, rec_source, resolved_dir, resolved_cache) =
+            py.allow_threads(|| {
+                new_engine(
+                    backend,
+                    &size,
+                    det_size.as_deref(),
+                    rec_size.as_deref(),
+                    dir.as_deref(),
+                    cache.as_deref(),
+                    threads,
+                    rec_batch,
+                    det_max_side,
+                    det_min_side,
+                    rec_min_width,
+                    det_thresh,
+                    det_box_thresh,
+                    det_unclip_ratio,
+                    det_max_candidates,
+                    text_score,
+                    det_use_dilation,
+                )
+            })?;
         Ok(Self {
             inner: Mutex::new(engine),
             backend: backend_static,
             det_source,
             rec_source,
             model_dir: resolved_dir,
+            cache_dir: resolved_cache,
         })
     }
 
@@ -1383,6 +1440,7 @@ impl OcrEngine {
         out.set_item("det_source", self.det_source)?;
         out.set_item("rec_source", self.rec_source)?;
         out.set_item("model_dir", self.model_dir.clone())?;
+        out.set_item("cache_dir", self.cache_dir.clone())?;
         for (key, value) in settings {
             out.set_item(key, value)?;
         }
@@ -1519,7 +1577,7 @@ fn default_engine() -> PyResult<&'static Mutex<BackendEngine>> {
     }
     let built = new_engine(
         default_backend(), "tiny", None, None, None, None, None, None, None, None, None, None, None,
-        None, None, None,
+        None, None, None, None,
     )?;
     Ok(DEFAULT_ENGINE.get_or_init(|| Mutex::new(built.0)))
 }
