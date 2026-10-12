@@ -159,6 +159,51 @@ def test_invalid_arrays_and_colorspace():
     assert e.ocr(_bytes())["bounds"]  # errors must not poison the engine
 
 
+def test_array_shape_dtype_and_contiguity_errors():
+    """Edge shapes/dtypes/layouts must raise the documented messages."""
+    e = eng()
+    rgb = _rgb()
+    h, w, _ = rgb.shape
+    for bad in (rgb.astype(np.float64), rgb.astype(np.int32)):
+        with pytest.raises(ValueError, match="uint8"):
+            e.ocr(bad)
+    with pytest.raises(ValueError, match=r"\(H, W, 3\)"):
+        e.ocr(rgb[:, :, :1])  # (H, W, 1) is not a supported layout
+    with pytest.raises(ValueError, match=r"\(H, W, 3\)"):
+        e.ocr(np.zeros((h, w, 3, 1), dtype=np.uint8))
+    with pytest.raises(ValueError, match="nonzero"):
+        e.ocr(np.zeros((0, w, 3), dtype=np.uint8))
+    with pytest.raises(ValueError, match="nonzero"):
+        e.ocr(np.zeros((h, 0), dtype=np.uint8))
+    with pytest.raises(ValueError, match="C-contiguous"):
+        e.ocr(np.asfortranarray(rgb))
+
+
+def test_read_only_array_matches_writable():
+    e = eng()
+    frozen = _rgb().copy()
+    frozen.setflags(write=False)
+    assert _sig(e.ocr(frozen)) == _sig(e.ocr(_rgb()))
+
+
+def test_array_error_strings_and_chunk_indices():
+    """Error messages name the offending input, and batch indices are global
+    across chunk boundaries (the decode error happens inside run_ocr_batch)."""
+    e = eng()
+    bad = _rgb().astype(np.float32)
+    with pytest.raises(ValueError, match="uint8"):
+        e.det(bad)
+    with pytest.raises(ValueError, match="uint8"):
+        e.prepare(bad)
+    with pytest.raises(ValueError, match="crop 0"):
+        e.rec([bad])
+    with pytest.raises(ValueError, match="image 1"):
+        e.ocr_batch([_bytes(), np.zeros((0, 4, 3), dtype=np.uint8)], batch_size=2)
+    with pytest.raises(RuntimeError, match="image 3"):
+        e.ocr_batch([_bytes(), _bytes(), _bytes(), b"invalid"], batch_size=2)
+    assert e.ocr(_bytes())["bounds"]  # errors must not poison the engine
+
+
 def test_bytes_only_without_numpy():
     """Bytes inputs must work on a bare install with no numpy.
 

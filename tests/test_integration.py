@@ -6,8 +6,13 @@ Self-contained — uses the bundled fixture image under tests/fixtures/.
 or directly:
     python faster_paddle/tests/test_integration.py
 """
+import functools
+import http.server
 import io
+import json
 import os
+import shutil
+import threading
 import time
 
 import faster_paddle
@@ -252,9 +257,10 @@ def test_short_labels_with_model_specific_padding():
 
 def test_ocr_batch_text_score_keeps_pages_aligned():
     """Regression: when `text_score` filters reads, every page of `ocr_batch`
-    must still receive only its own boxes. The first page has filtered crops,
-    so a filtered recognition stream would push the label page's boxes onto it
-    (and strip them from the label page)."""
+    must still receive only its own boxes. The document pages have filtered
+    crops, so a filtered recognition stream would push the label page's boxes
+    onto them (and strip them from the label page). A three-page batch also
+    catches a page stealing from a non-adjacent page."""
     doc = _small()
     labels = open(os.path.join(HERE, "fixtures", "labels.png"), "rb").read()
     eng = faster_paddle.OcrEngine(model_size="tiny", threads=2, text_score=0.5)
@@ -265,9 +271,13 @@ def test_ocr_batch_text_score_keeps_pages_aligned():
     label_only = set(label_single) - set(doc_single)
     assert label_only, "fixtures no longer have page-distinct tokens"
 
-    batch_doc, batch_labels = eng.ocr_batch([doc, labels])
-    assert not (label_only & set(texts(batch_doc))), "document page stole label-page boxes"
-    assert len(texts(batch_labels)) == len(label_single), "label page lost boxes to the document page"
+    pages = eng.ocr_batch([doc, labels, doc])
+    assert len(pages) == 3
+    batch_doc, batch_labels, batch_doc2 = (texts(p) for p in pages)
+    assert not (label_only & set(batch_doc)), "document page stole label-page boxes"
+    assert not (label_only & set(batch_doc2)), "second document page stole label-page boxes"
+    assert len(batch_labels) == len(label_single), "label page lost boxes to the document page"
+    assert batch_doc == batch_doc2, "identical pages must stay identical in one batch"
 
 
 @requires_ort
@@ -399,6 +409,65 @@ def test_det_use_dilation_config_and_batch():
     assert eng.ocr_batch([data, data]) == [expected, expected]
 
 
+@pytest.mark.parametrize(
+    "env,value,key,expected",
+    (
+        ("OCR_DET_THRESH", "0.35", "det_thresh", 0.35),
+        ("OCR_DET_BOX_THRESH", "0.60", "det_box_thresh", 0.60),
+        ("OCR_DET_UNCLIP_RATIO", "2.5", "det_unclip_ratio", 2.5),
+        ("OCR_DET_MAX_CANDIDATES", "7", "det_max_candidates", 7),
+        ("OCR_TEXT_SCORE", "0.25", "text_score", 0.25),
+        ("OCR_DET_USE_DILATION", "1", "det_use_dilation", 1),
+        ("OCR_REC_MIN_WIDTH", "320", "rec_min_width", 320),
+        ("OCR_DET_MIN_SIDE", "1024", "det_min_side", 1024),
+    ),
+)
+def test_knob_env_overrides_default(monkeypatch, env, value, key, expected):
+    monkeypatch.setenv(env, value)
+    cfg = faster_paddle.OcrEngine(model_size="tiny", threads=2).config
+    assert cfg[key] == pytest.approx(expected)
+
+
+def test_explicit_knobs_beat_env(monkeypatch):
+    # an explicit argument is used before the env is even parsed: invalid env
+    # values must not fail construction nor override a valid argument
+    monkeypatch.setenv("OCR_DET_BOX_THRESH", "1.5")
+    monkeypatch.setenv("OCR_DET_MAX_CANDIDATES", "0")
+    monkeypatch.setenv("OCR_DET_USE_DILATION", "maybe")
+    cfg = faster_paddle.OcrEngine(
+        model_size="tiny", threads=2,
+        det_box_thresh=0.5, det_max_candidates=1000, det_use_dilation=False,
+    ).config
+    assert cfg["det_box_thresh"] == pytest.approx(0.5)
+    assert cfg["det_max_candidates"] == 1000
+    assert cfg["det_use_dilation"] == 0
+    # a typo in a boolean env flag alone is ignored, not mapped to false
+    monkeypatch.delenv("OCR_DET_BOX_THRESH")
+    monkeypatch.delenv("OCR_DET_MAX_CANDIDATES")
+    cfg = faster_paddle.OcrEngine(model_size="tiny", threads=2).config
+    assert cfg["det_use_dilation"] == 0
+
+
+def test_each_det_knob_alone_shifts_output():
+    # det_box_thresh, det_unclip_ratio and det_use_dilation each change the
+    # end-to-end result on their own (they were previously only compared as a
+    # combined set, and dilation was never compared True vs False)
+    data = _small()
+    base = _signature(faster_paddle.OcrEngine(model_size="tiny", threads=2).ocr(data))
+    strict = _signature(
+        faster_paddle.OcrEngine(model_size="tiny", threads=2, det_box_thresh=0.9).ocr(data)
+    )
+    assert 0 < len(strict) < len(base)
+    expanded = _signature(
+        faster_paddle.OcrEngine(model_size="tiny", threads=2, det_unclip_ratio=3.5).ocr(data)
+    )
+    assert expanded != base
+    merged = _signature(
+        faster_paddle.OcrEngine(model_size="tiny", threads=2, det_use_dilation=True).ocr(data)
+    )
+    assert merged != base
+
+
 def test_rec_only_reads_precropped_lines():
     eng = faster_paddle.OcrEngine(model_size="tiny", threads=2)
     assert eng.rec([]) == []
@@ -440,6 +509,41 @@ def test_det_only_matches_ocr_boxes():
     assert boxes == eng.det(data)  # deterministic
     with pytest.raises(RuntimeError):
         eng.det(b"invalid")
+
+
+def test_rec_returns_reads_ocr_text_score_would_drop():
+    # `rec()` is documented as unfiltered: crops whose read is whitespace-only
+    # or below `text_score` are still returned, while `ocr` drops them
+    data = _small()
+    unfiltered = faster_paddle.OcrEngine(model_size="tiny", threads=2, text_score=0.0)
+    filtered = faster_paddle.OcrEngine(model_size="tiny", threads=2, text_score=0.5)
+    full = unfiltered.ocr(data)
+    dropped = [
+        b
+        for b in full["bounds"].values()
+        if b["confidence"] < 0.5 or not b["text"].strip()
+    ]
+    assert dropped, "fixture no longer has reads a text_score of 0.5 would drop"
+
+    src = Image.open(io.BytesIO(data)).convert("RGB")
+    crops = []
+    for b in dropped[:3]:
+        x1, y1 = b["topLeftCoord"]
+        x2, y2 = b["bottomRightCoord"]
+        crop = src.crop((max(0, x1), max(0, y1), max(x1 + 1, x2), max(y1 + 1, y2)))
+        buf = io.BytesIO()
+        crop.save(buf, format="PNG")
+        crops.append(buf.getvalue())
+    out = filtered.rec(crops)
+    assert len(out) == len(crops)  # every crop read, none filtered out
+    assert out == unfiltered.rec(crops)  # text_score does not reach rec()
+    assert any(e["confidence"] < 0.5 or not e["text"].strip() for e in out)
+    # the same threshold does apply to ocr()
+    filtered_full = filtered.ocr(data)
+    assert len(filtered_full["bounds"]) < len(full["bounds"])
+    for b in filtered_full["bounds"].values():
+        assert b["confidence"] >= 0.5 - 1e-6
+        assert b["text"].strip()
 
 
 def test_mixed_model_sizes():
@@ -581,6 +685,140 @@ def test_truncated_cache_is_not_trusted(tmp_path, monkeypatch):
     else:
         # bundled-all wheel: bundled weights shadow the cache
         assert eng.config["det_source"] == "bundled"
+
+
+@requires_ort
+def test_default_cache_dir_is_versioned(monkeypatch):
+    # with no cache_dir argument and no env override the OS cache root is used,
+    # namespaced per package version (an override is unversioned by contract)
+    monkeypatch.delenv("FASTER_PADDLE_CACHE_DIR", raising=False)
+    monkeypatch.delenv("FASTER_PADDLE_MODEL_DIR", raising=False)
+    eng = faster_paddle.OcrEngine(model_size="tiny", threads=2, model_dir=MODELS_DIR)
+    cache = eng.config["cache_dir"]
+    assert os.path.basename(cache) == "v" + faster_paddle.__version__
+    assert os.path.basename(os.path.dirname(cache)) == "faster_paddle"
+
+
+def _serve_directory(directory):
+    """Serve `directory` over HTTP on a random loopback port."""
+
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), functools.partial(Quiet, directory=str(directory))
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+@requires_ort
+def test_mirror_download_lands_in_cache_and_is_reused(tmp_path, monkeypatch):
+    """The code-only path against a local release mirror: the first engine
+    reports `downloaded` and lands both files byte-identically in the cache
+    (no temp residue), a second engine with the mirror unreachable reuses them
+    (`cached`), and a plausible-size but wrong-magic cache entry is refetched
+    (A2/A3 repair, E1 landing)."""
+    asset_root = tmp_path / "mirror" / ("v" + faster_paddle.__version__)
+    asset_root.mkdir(parents=True)
+    served = {}
+    for local_name, asset in (
+        ("det.onnx", "ppocrv6_tiny_det.onnx"),
+        ("rec.onnx", "ppocrv6_tiny_rec.onnx"),
+    ):
+        src = os.path.join(MODELS_DIR, "tiny", local_name)
+        shutil.copy(src, asset_root / asset)
+        with open(src, "rb") as f:
+            served[local_name] = f.read()
+
+    cache = tmp_path / "cache"
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    server = _serve_directory(asset_root.parent)
+    try:
+        # trailing slash on purpose: the base URL must be trimmed (A13)
+        monkeypatch.setenv(
+            "FASTER_PADDLE_RELEASE_BASE", f"http://127.0.0.1:{server.server_port}/"
+        )
+        eng = faster_paddle.OcrEngine(
+            model_size="tiny", threads=2, model_dir=str(empty), cache_dir=str(cache)
+        )
+        if eng.config["det_source"] == "bundled":
+            pytest.skip("bundled-all wheel resolves weights before the cache")
+        assert eng.config["cache_dir"] == str(cache)
+        assert (eng.config["det_source"], eng.config["rec_source"]) == (
+            "downloaded",
+            "downloaded",
+        )
+        assert sorted(p.name for p in (cache / "tiny").iterdir()) == ["det.onnx", "rec.onnx"]
+        for name, expected in served.items():
+            assert (cache / "tiny" / name).read_bytes() == expected
+
+        # with the mirror unreachable the fully-populated cache must be reused
+        monkeypatch.setenv("FASTER_PADDLE_RELEASE_BASE", "http://127.0.0.1:1")
+        again = faster_paddle.OcrEngine(
+            model_size="tiny", threads=2, model_dir=str(empty), cache_dir=str(cache)
+        )
+        assert (again.config["det_source"], again.config["rec_source"]) == ("cached", "cached")
+
+        # corrupt entry (right size, wrong magic) -> refetched, rec stays cached
+        (cache / "tiny" / "det.onnx").write_bytes(b"\x00" * 2_000_000)
+        monkeypatch.setenv(
+            "FASTER_PADDLE_RELEASE_BASE", f"http://127.0.0.1:{server.server_port}/"
+        )
+        repaired = faster_paddle.OcrEngine(
+            model_size="tiny", threads=2, model_dir=str(empty), cache_dir=str(cache)
+        )
+        assert repaired.config["det_source"] == "downloaded"
+        assert repaired.config["rec_source"] == "cached"
+        assert (cache / "tiny" / "det.onnx").read_bytes() == served["det.onnx"]
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert sorted(p.name for p in (cache / "tiny").iterdir()) == ["det.onnx", "rec.onnx"]
+
+
+@requires_ort
+def test_bundled_source_when_no_local_or_cache(tmp_path, monkeypatch):
+    # a bundled-all wheel resolves embedded weights before cache/download; a
+    # code-only wheel (needs a download) skips. `bundled` provenance is only
+    # observable on a wheel that actually ships weights.
+    monkeypatch.setenv("FASTER_PADDLE_RELEASE_BASE", "http://127.0.0.1:1")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    try:
+        eng = faster_paddle.OcrEngine(
+            model_size="tiny", threads=2, model_dir=str(empty), cache_dir=str(tmp_path / "cache")
+        )
+    except RuntimeError as e:
+        assert "failed to download" in str(e), e
+        pytest.skip("code-only wheel downloads instead of bundling")
+    assert (eng.config["det_source"], eng.config["rec_source"]) == ("bundled", "bundled")
+
+
+@requires_ort
+def test_explicit_model_dir_beats_populated_env_dir(tmp_path, monkeypatch):
+    # two populated directories: the explicit argument must win. The env dir
+    # carries the real dictionary; the arg dir maps every class to "@", so the
+    # decoded text proves which directory was used.
+    env_dir = tmp_path / "env"
+    arg_dir = tmp_path / "arg"
+    for d in (env_dir, arg_dir):
+        (d / "tiny").mkdir(parents=True)
+        for name in ("det.onnx", "rec.onnx"):
+            shutil.copy(os.path.join(MODELS_DIR, "tiny", name), d / "tiny" / name)
+    shutil.copy(os.path.join(MODELS_DIR, "tiny", "char_dict.json"), env_dir / "tiny" / "char_dict.json")
+    (arg_dir / "tiny" / "char_dict.json").write_text(json.dumps(["@"] * 7000))
+
+    monkeypatch.setenv("FASTER_PADDLE_MODEL_DIR", str(env_dir))
+    eng = faster_paddle.OcrEngine(model_size="tiny", threads=2, model_dir=str(arg_dir))
+    assert eng.config["model_dir"] == str(arg_dir)
+    assert (eng.config["det_source"], eng.config["rec_source"]) == ("local", "local")
+    r = eng.ocr(_small())
+    assert len(r["bounds"]) > 50
+    assert "@" in r["text"]
 
 
 def test_model_size_validated_even_when_overridden(tmp_path, monkeypatch):

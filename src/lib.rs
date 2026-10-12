@@ -652,6 +652,12 @@ fn image_from_numpy(obj: &Bound<'_, PyAny>, colorspace: ColorSpace) -> Result<Im
         .downcast::<PyArrayDyn<u8>>()
         .map_err(|e| e.to_string())?;
     let view = arr.readonly();
+    // ndarray's `as_slice` also accepts Fortran order, which would be read as
+    // a different (transposed) image; only C order matches the documented
+    // contract and means the flat slice is row-major pixels
+    if !view.is_c_contiguous() {
+        return Err("array must be C-contiguous; try np.ascontiguousarray(arr)".to_string());
+    }
     let flat = view.as_slice().map_err(|_| {
         "array must be C-contiguous; try np.ascontiguousarray(arr)".to_string()
     })?;
