@@ -31,7 +31,7 @@ use crate::cv;
 use crate::ocr::{
     crop_quad, ctc_decode, db_postprocess, det_resize_dims_with_min, plan_rec_batches,
     quad_to_box4, rec_width, resize_to_tensor, sort_boxes, split_page_results, ImageRgb,
-    OcrResult, DET_MEAN, DET_STD, LIMIT_SIDE_LEN, MAX_SIDE_LIMIT, REC_H, REC_MAX_W,
+    OcrResult, DET_MEAN, DET_STD, LIMIT_SIDE_LEN, MAX_SIDE_LIMIT, REC_H,
 };
 use openvino::{
     CompiledModel, Core, DeviceType, ElementType, InferRequest, PartialShape, Shape, Tensor,
@@ -283,9 +283,9 @@ impl OvEngine {
             _det_compiled: det_compiled,
             _rec_compiled: rec_compiled,
             workers,
-            rec_min_width: crate::env_usize("OCR_REC_MIN_WIDTH")
-                .unwrap_or(320)
-                .clamp(64, REC_MAX_W),
+            // provisional; `new_engine` always overwrites it via
+            // `set_input_limits` with the resolved, validated value
+            rec_min_width: 320,
             det_min_side: std::env::var("OCR_DET_MIN_SIDE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -468,6 +468,12 @@ impl OvEngine {
                 .map_err(|e| ov_err("det output", e))?;
             let dims = out.get_shape().map_err(|e| ov_err("det out shape", e))?;
             let dims = dims.get_dimensions();
+            if dims.len() < 4 {
+                return Err(format!(
+                    "detector output has {} dims, expected 4",
+                    dims.len()
+                ));
+            }
             let (ph, pw) = (dims[2] as usize, dims[3] as usize);
             if dbg {
                 eprintln!("[dbg]   det OV infer: {:.3}s", tinf.elapsed().as_secs_f64());
@@ -482,6 +488,13 @@ impl OvEngine {
             let data = out
                 .get_data::<f32>()
                 .map_err(|e| ov_err("det read", e))?;
+            if data.len() < ph.saturating_mul(pw) {
+                return Err(format!(
+                    "detector output tensor has {} values, expected at least {}",
+                    data.len(),
+                    ph.saturating_mul(pw)
+                ));
+            }
             db_postprocess(
                 &data,
                 pw,
@@ -662,11 +675,17 @@ fn rec_single_run(
     let out = req.get_output_tensor().map_err(|e| ov_err("rec output", e))?;
     let dims = out.get_shape().map_err(|e| ov_err("rec out shape", e))?;
     let dims = dims.get_dimensions();
+    if dims.len() < 3 {
+        return Err(format!(
+            "recognizer output has {} dims, expected 3",
+            dims.len()
+        ));
+    }
     let (t, cls) = (dims[1] as usize, dims[2] as usize);
     let infer_s = ti.elapsed().as_secs_f64();
     let tc = std::time::Instant::now();
     let data = out.get_data::<f32>().map_err(|e| ov_err("rec read", e))?;
-    let res = ctc_decode(chars, &data, t, cls);
+    let res = ctc_decode(chars, &data, t, cls)?;
     if dbg {
         eprintln!(
             "[dbg]     rec crop w={w} bucket={bucket}: prep {prep_s:.3}s infer {infer_s:.3}s ctc {:.3}s",
@@ -690,6 +709,6 @@ mod tests {
         assert_eq!(rec_bucket(1281), 1600);
         assert_eq!(rec_bucket(3200), 3200);
         // widest bucket always fits the widest tensor the ORT path computes
-        assert!(REC_BUCKETS.contains(&REC_MAX_W));
+        assert!(REC_BUCKETS.contains(&crate::ocr::REC_MAX_W));
     }
 }

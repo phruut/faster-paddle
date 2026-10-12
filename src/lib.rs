@@ -174,6 +174,7 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
 #[cfg(feature = "ort-backend")]
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 // ---- model weights (optional at build time) ----
@@ -260,14 +261,25 @@ fn resolve_model_dir(explicit: Option<&str>) -> Option<std::path::PathBuf> {
 }
 
 /// Local `{model_dir}/{size}/{filename}` override, when present and plausible.
+/// A file too small to be real weights (a placeholder or git-lfs pointer) is
+/// ignored with a warning instead of silently shadowing bundled/cached weights.
 #[cfg(feature = "ort-backend")]
 fn local_model_bytes(
     dir: Option<&std::path::Path>,
     size: &str,
     filename: &str,
 ) -> Option<Vec<u8>> {
-    let bytes = std::fs::read(dir?.join(size).join(filename)).ok()?;
-    (bytes.len() > 1024).then_some(bytes)
+    let path = dir?.join(size).join(filename);
+    let bytes = std::fs::read(&path).ok()?;
+    if bytes.len() > 1024 {
+        return Some(bytes);
+    }
+    eprintln!(
+        "[faster-paddle] ignoring {} ({} bytes): too small for model weights",
+        path.display(),
+        bytes.len()
+    );
+    None
 }
 
 /// Optional `{model_dir}/{size}/char_dict.json` for custom recognizers.
@@ -299,23 +311,22 @@ fn rec_asset(size: &str) -> &'static str {
 
 /// Per-side model lookups so det and rec sizes can be mixed in one engine.
 /// Also returns where the weights came from (`local`, `bundled`, `cached`,
-/// `downloaded`) for `config` diagnostics.
+/// `downloaded`) for `config` diagnostics. Sizes are validated by `new_engine`
+/// before any lookup.
 #[cfg(feature = "ort-backend")]
 fn resolve_det(
     size: &str,
     model_dir: Option<&std::path::Path>,
     cache_root: &std::path::Path,
-) -> PyResult<(Cow<'static, [u8]>, f32, &'static str)> {
-    check_size(size)?;
-    let thresh = if size == "tiny" { 0.40 } else { 0.45 };
+) -> PyResult<(Cow<'static, [u8]>, &'static str)> {
     if let Some(bytes) = local_model_bytes(model_dir, size, "det.onnx") {
-        return Ok((Cow::Owned(bytes), thresh, "local"));
+        return Ok((Cow::Owned(bytes), "local"));
     }
     if let Some(bytes) = bundled_det(size) {
-        return Ok((Cow::Borrowed(bytes), thresh, "bundled"));
+        return Ok((Cow::Borrowed(bytes), "bundled"));
     }
     let (bytes, source) = model_bytes(size, "det.onnx", det_asset(size), cache_root)?;
-    Ok((Cow::Owned(bytes), thresh, source))
+    Ok((Cow::Owned(bytes), source))
 }
 
 #[cfg(feature = "ort-backend")]
@@ -324,7 +335,6 @@ fn resolve_rec(
     model_dir: Option<&std::path::Path>,
     cache_root: &std::path::Path,
 ) -> PyResult<(Cow<'static, [u8]>, Vec<String>, &'static str)> {
-    check_size(size)?;
     let dict = match local_dict(model_dir, size) {
         Some(json) => parse_dict_owned(&json, size)?,
         None => parse_dict(if size == "tiny" { TINY_DICT } else { BIG_DICT }),
@@ -341,11 +351,13 @@ fn resolve_rec(
 
 /// Release host for one-time model downloads. Overridable for testing via
 /// `FASTER_PADDLE_RELEASE_BASE` (e.g. a local mirror); production uses the
-/// GitHub release.
+/// GitHub release. Trailing slashes are trimmed so the `{base}/v{VERSION}/...`
+/// URL never gains a double slash.
 fn release_base() -> String {
     std::env::var("FASTER_PADDLE_RELEASE_BASE")
         .ok()
         .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
         .unwrap_or_else(|| RELEASE_BASE.to_string())
 }
 
@@ -380,7 +392,7 @@ fn cache_dir_for(size: &str, root: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Cache hit or one-time download of a non-bundled ONNX file. Returns the
-/// bytes and whether they were `cached` or `downloaded`.
+/// bytes and the provenance for `config` (`cached`/`downloaded`).
 #[cfg(feature = "ort-backend")]
 fn model_bytes(
     size: &str,
@@ -388,25 +400,8 @@ fn model_bytes(
     asset: &str,
     cache_root: &std::path::Path,
 ) -> PyResult<(Vec<u8>, &'static str)> {
-    let cache = cache_dir_for(size, cache_root);
-    let path = cache.join(filename);
-    if let Ok(bytes) = std::fs::read(&path) {
-        if bytes.len() > 1024 {
-            return Ok((bytes, "cached"));
-        }
-    }
-    Ok((fetch_cached(&cache, filename, asset, size)?, "downloaded"))
-}
-
-#[cfg(feature = "ort-backend")]
-fn fetch_cached(
-    cache_dir: &std::path::Path,
-    filename: &str,
-    asset: &str,
-    size: &str,
-) -> PyResult<Vec<u8>> {
     fetch_cached_with_hint(
-        cache_dir,
+        &cache_dir_for(size, cache_root),
         filename,
         asset,
         size,
@@ -417,42 +412,140 @@ fn fetch_cached(
     )
 }
 
+/// Per-format plausibility floor for cached/downloaded weights. Real assets are
+/// well above these (smallest shipped: ~157 KB IR xml, ~857 KB IR bin, 1.8 MB
+/// ONNX), so anything smaller is treated as truncated and refetched.
+fn min_weights_bytes(filename: &str) -> usize {
+    match std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
+        Some("xml") => 64 * 1024,
+        Some("bin") => 256 * 1024,
+        _ => 512 * 1024,
+    }
+}
+
+/// Whether bytes could be real weights: above the per-format floor, and with a
+/// format magic where one exists. Truncated or garbage files fail so a cache
+/// entry can never be trusted just for being large.
+fn plausible_weights(filename: &str, bytes: &[u8]) -> bool {
+    if bytes.len() < min_weights_bytes(filename) {
+        return false;
+    }
+    match std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
+        // ONNX ModelProto always starts with field 1 (ir_version), tag 0x08
+        Some("onnx") => bytes.first() == Some(&0x08),
+        // OpenVINO IR xml starts with an xml declaration
+        Some("xml") => bytes.starts_with(b"<?xml"),
+        _ => true,
+    }
+}
+
+/// Shared agent for weight downloads: bounded connect and per-read stalls so a
+/// dead mirror cannot hang engine construction forever.
+fn download_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::builder()
+            .timeout_connect(std::time::Duration::from_secs(30))
+            .timeout_read(std::time::Duration::from_secs(60))
+            .timeout_write(std::time::Duration::from_secs(30))
+            .build()
+    })
+}
+
+/// Atomic cache write: unique temp file in the same directory, then rename.
+/// `create_new` keeps concurrent writers off each other's temp path; a failed
+/// rename removes the temp file and surfaces as an error instead of a
+/// "downloaded" file that never landed.
+fn write_cache_file(cache_dir: &std::path::Path, filename: &str, bytes: &[u8]) -> PyResult<()> {
+    static TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = cache_dir.join(format!(
+        ".{filename}.{}.{nanos}.{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(PyRuntimeError::new_err(format!("cannot write cache: {e}")));
+    }
+    if let Err(e) = std::fs::rename(&tmp, cache_dir.join(filename)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(PyRuntimeError::new_err(format!(
+            "cannot move cached weights into place: {e}"
+        )));
+    }
+    Ok(())
+}
+
+/// Cache hit or one-time download of one weights file. Returns the bytes and
+/// `cached`/`downloaded` from a single cache probe, so a concurrent writer's
+/// file can never masquerade as a fresh download in `config`.
 fn fetch_cached_with_hint(
     cache_dir: &std::path::Path,
     filename: &str,
     asset: &str,
     size: &str,
     offline_hint: &str,
-) -> PyResult<Vec<u8>> {
+) -> PyResult<(Vec<u8>, &'static str)> {
     let path = cache_dir.join(filename);
     if let Ok(bytes) = std::fs::read(&path) {
-        if bytes.len() > 1024 {
-            return Ok(bytes);
+        if plausible_weights(filename, &bytes) {
+            return Ok((bytes, "cached"));
         }
+        eprintln!(
+            "[faster-paddle] ignoring invalid cached {} ({} bytes): refetching",
+            path.display(),
+            bytes.len()
+        );
     }
     std::fs::create_dir_all(cache_dir)
         .map_err(|e| PyRuntimeError::new_err(format!("cannot create cache dir: {e}")))?;
     let url = format!("{}/v{VERSION}/{asset}", release_base());
-    let resp = ureq::get(&url).call().map_err(|e| {
+    let resp = download_agent().get(&url).call().map_err(|e| {
         PyRuntimeError::new_err(format!(
             "failed to download {size} model from {url}: {e}; {offline_hint}"
         ))
     })?;
+    let expected_len: Option<usize> = resp
+        .header("Content-Length")
+        .and_then(|v| v.trim().parse().ok());
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut resp.into_reader(), &mut bytes)
         .map_err(|e| PyRuntimeError::new_err(format!("failed reading {size} model: {e}")))?;
-    if bytes.len() <= 1024 {
+    if let Some(expected) = expected_len {
+        if bytes.len() != expected {
+            return Err(PyRuntimeError::new_err(format!(
+                "downloaded {size} model from {url} is truncated: {} of {expected} bytes",
+                bytes.len()
+            )));
+        }
+    }
+    if !plausible_weights(filename, &bytes) {
         return Err(PyRuntimeError::new_err(format!(
             "downloaded {size} model from {url} looks invalid ({} bytes)",
             bytes.len()
         )));
     }
-    // atomic-ish write via temp file
-    let tmp = cache_dir.join(format!("{filename}.tmp"));
-    std::fs::write(&tmp, &bytes)
-        .map_err(|e| PyRuntimeError::new_err(format!("cannot write cache: {e}")))?;
-    let _ = std::fs::rename(&tmp, &path);
-    Ok(bytes)
+    write_cache_file(cache_dir, filename, &bytes)?;
+    Ok((bytes, "downloaded"))
 }
 
 /// Decode encoded image bytes (jpeg/png/...) into an RGB buffer. The network
@@ -497,10 +590,17 @@ enum RawInput {
 /// Whether the `numpy` module is importable. pyo3-numpy's array downcasts
 /// panic (not error) when the capsule is unavailable, so the array paths must
 /// check first; bytes-only use works on a bare install with no numpy at all.
-/// Cached: availability cannot change after first use in a process.
+/// Only success is cached: a transient import failure stays retryable.
 fn numpy_available(py: Python<'_>) -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| py.import("numpy").is_ok())
+    static AVAILABLE: OnceLock<()> = OnceLock::new();
+    if AVAILABLE.get().is_some() {
+        return true;
+    }
+    if py.import("numpy").is_ok() {
+        let _ = AVAILABLE.set(());
+        return true;
+    }
+    false
 }
 
 /// Split a `bytes | numpy.ndarray` argument. The ndarray branch is checked
@@ -689,10 +789,26 @@ fn env_float(name: &str) -> Option<f64> {
     std::env::var(name).ok()?.parse::<f64>().ok()
 }
 
+/// Canonical spellings only: `1`/`true`/`0`/`false` (case-insensitive).
+fn parse_bool(raw: &str) -> Option<bool> {
+    match raw.to_ascii_lowercase().as_str() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Reads a boolean env flag strictly: an unrecognized value is ignored with a
+/// warning so a typo can neither flip nor silently disable a flag.
 fn env_bool(name: &str) -> Option<bool> {
-    std::env::var(name)
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    let raw = std::env::var(name).ok()?;
+    match parse_bool(&raw) {
+        Some(v) => Some(v),
+        None => {
+            eprintln!("[faster-paddle] ignoring {name}={raw:?}: expected 1/0/true/false");
+            None
+        }
+    }
 }
 
 /// Backend used when the caller passes none: the wheel's compiled runtime.
@@ -733,6 +849,13 @@ fn new_engine(
     Option<String>,
     String,
 )> {
+    // sizes first: a bad model_size must fail even when both per-side sizes
+    // override it, and every knob is validated before any cache/download work
+    check_size(model_size)?;
+    let det_size = det_model_size.unwrap_or(model_size);
+    let rec_size = rec_model_size.unwrap_or(model_size);
+    check_size(det_size)?;
+    check_size(rec_size)?;
     if threads == Some(0) || rec_batch == Some(0) {
         return Err(PyValueError::new_err(
             "threads and rec_batch must be positive",
@@ -743,10 +866,20 @@ fn new_engine(
             "det_max_side must be at least 32 (or <=0 for 4000); det_min_side must be nonnegative",
         ));
     }
-    if rec_min_width.is_some_and(|v| !(64..=3200).contains(&v)) {
-        return Err(PyValueError::new_err(
-            "rec_min_width must be between 64 and 3200",
-        ));
+    // Short-label validation supports smaller tensors for tiny/small. Medium
+    // retains the reference floor until it has equivalent coverage. The env
+    // override gets the same range check as the argument (no silent clamp).
+    let width = rec_min_width
+        .or_else(|| env_usize("OCR_REC_MIN_WIDTH"))
+        .unwrap_or(match rec_size {
+            "tiny" => 64,
+            "small" => 96,
+            _ => 320,
+        });
+    if !(64..=3200).contains(&width) {
+        return Err(PyValueError::new_err(format!(
+            "rec_min_width must be between 64 and 3200; got {width}"
+        )));
     }
     let det_thresh = det_thresh
         .or_else(|| env_float("OCR_DET_THRESH").map(|v| v as f32))
@@ -792,12 +925,21 @@ fn new_engine(
     let det_use_dilation = det_use_dilation
         .or_else(|| env_bool("OCR_DET_USE_DILATION"))
         .unwrap_or(false);
+    // the per-size box default is known before any lookup; resolving the knob
+    // here means an invalid value can never trigger a download first
+    let box_default = if det_size == "tiny" { 0.40 } else { 0.45 };
+    let det_box_thresh = det_box_thresh
+        .or_else(|| env_float("OCR_DET_BOX_THRESH").map(|v| v as f32))
+        .unwrap_or(box_default);
+    if !(0.0..=1.0).contains(&det_box_thresh) {
+        return Err(PyValueError::new_err(
+            "det_box_thresh must be between 0.0 and 1.0",
+        ));
+    }
     let t = threads
         .or_else(|| env_usize("OCR_THREADS"))
         .unwrap_or_else(hardware::physical_cores)
         .max(1);
-    let det_size = det_model_size.unwrap_or(model_size);
-    let rec_size = rec_model_size.unwrap_or(model_size);
     let dir = resolve_model_dir(model_dir);
     let cache = cache_root(resolve_cache_dir(cache_dir).as_deref())?;
     let det_t = env_usize("OCR_DET_THREADS").unwrap_or(t.min(8)).clamp(1, t);
@@ -813,21 +955,12 @@ fn new_engine(
             t.min(if rec_size == "medium" { 8 } else { 32 })
         })
         .clamp(1, t);
-    // Short-label validation supports smaller tensors for tiny/small. Medium
-    // retains the reference floor until it has equivalent coverage.
-    let width = rec_min_width
-        .or_else(|| env_usize("OCR_REC_MIN_WIDTH"))
-        .unwrap_or(match rec_size {
-            "tiny" => 64,
-            "small" => 96,
-            _ => 320,
-        })
-        .clamp(64, 3200);
     if backend == "ov" {
         #[cfg(feature = "openvino-backend")]
         return new_ov_engine(
             det_size,
             rec_size,
+            model_dir,
             dir.as_deref(),
             cache.as_path(),
             t,
@@ -856,19 +989,10 @@ fn new_engine(
     ));
     #[cfg(feature = "ort-backend")]
     {
-        let (det_bytes, box_default, det_source) =
-            resolve_det(det_size, dir.as_deref(), cache.as_path())?;
+        let (det_bytes, det_source) = resolve_det(det_size, dir.as_deref(), cache.as_path())?;
         let (rec_bytes, dict, rec_source) =
             resolve_rec(rec_size, dir.as_deref(), cache.as_path())?;
         let rb = rec_batch.unwrap_or(ocr::DEFAULT_REC_BATCH);
-        let det_box_thresh = det_box_thresh
-            .or_else(|| env_float("OCR_DET_BOX_THRESH").map(|v| v as f32))
-            .unwrap_or(box_default);
-        if !(0.0..=1.0).contains(&det_box_thresh) {
-            return Err(PyValueError::new_err(
-                "det_box_thresh must be between 0.0 and 1.0",
-            ));
-        }
         let mut engine = BackendEngine::Ort(
             Engine::from_memory(
                 det_size,
@@ -905,13 +1029,14 @@ fn new_engine(
 fn new_ov_engine(
     det_size: &str,
     rec_size: &str,
+    explicit_dir: Option<&str>,
     model_dir: Option<&std::path::Path>,
     cache_root: &std::path::Path,
     threads: usize,
     det_threads: usize,
     pool: usize,
     det_max: i64,
-    det_box_thresh: Option<f32>,
+    det_box_thresh: f32,
     det_thresh: f32,
     det_unclip_ratio: f64,
     det_max_candidates: usize,
@@ -926,22 +1051,10 @@ fn new_ov_engine(
     Option<String>,
     String,
 )> {
-    check_size(det_size)?;
-    check_size(rec_size)?;
-    // Same per-size box default as the ORT path (`resolve_det`).
-    let box_default = if det_size == "tiny" { 0.40 } else { 0.45 };
-    let det_box_thresh = det_box_thresh
-        .or_else(|| env_float("OCR_DET_BOX_THRESH").map(|v| v as f32))
-        .unwrap_or(box_default);
-    if !(0.0..=1.0).contains(&det_box_thresh) {
-        return Err(PyValueError::new_err(
-            "det_box_thresh must be between 0.0 and 1.0",
-        ));
-    }
     // Weights resolve local-first, then cache/download — same contract as
-    // ONNX. `OV_IR_DIR`/explicit dir wins when it has the files; otherwise
-    // the release-hosted IR is fetched once and cached.
-    let ir_dir = resolve_ir_dir(model_dir);
+    // ONNX. Explicit `model_dir` beats `OV_IR_DIR` (constructor beats env),
+    // which beats the `FASTER_PADDLE_MODEL_DIR` fallback.
+    let ir_dir = resolve_ir_dir(explicit_dir, model_dir);
     let dict = match ir_dir.as_deref().and_then(|d| local_dict(Some(d), rec_size)) {
         Some(json) => parse_dict_owned(&json, rec_size)?,
         None => parse_dict(if rec_size == "tiny" {
@@ -1009,22 +1122,29 @@ fn ir_rec_assets(size: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// IR weight directory: `OV_IR_DIR` wins, else the shared `model_dir`.
-/// Layout mirrors the ONNX layout: `{dir}/{size}/{det.xml,det.bin,rec.xml,rec.bin}`.
-/// `None` means straight to cache/download (first OV use fetches the release
-/// IR once, like ONNX weights).
+/// IR weight directory: explicit `model_dir` beats `OV_IR_DIR`, which beats
+/// the `FASTER_PADDLE_MODEL_DIR` fallback. Layout mirrors the ONNX layout:
+/// `{dir}/{size}/{det.xml,det.bin,rec.xml,rec.bin}`. `None` means straight to
+/// cache/download (first OV use fetches the release IR once, like ONNX).
 #[cfg(feature = "openvino-backend")]
-fn resolve_ir_dir(explicit: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+fn resolve_ir_dir(
+    explicit: Option<&str>,
+    fallback: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    if let Some(raw) = explicit.filter(|s| !s.is_empty()) {
+        return Some(std::path::PathBuf::from(raw));
+    }
     if let Ok(raw) = std::env::var("OV_IR_DIR") {
         if !raw.is_empty() {
             return Some(std::path::PathBuf::from(raw));
         }
     }
-    explicit.map(|p| p.to_path_buf())
+    fallback.map(std::path::Path::to_path_buf)
 }
 
 /// One IR file: local layout first, else the shared cache or a one-time
-/// release download. Returns the path and `local`/`cached`/`downloaded`.
+/// release download. Returns the path and `local`/`cached`/`downloaded` with a
+/// single cache probe deciding the label.
 #[cfg(feature = "openvino-backend")]
 fn ir_file_resolved(
     dir: Option<&std::path::Path>,
@@ -1039,20 +1159,14 @@ fn ir_file_resolved(
         }
     }
     let cache = cache_dir_for(size, cache_root);
-    let path = cache.join(filename);
-    if let Ok(bytes) = std::fs::read(&path) {
-        if bytes.len() > 1024 {
-            return Ok((path, "cached"));
-        }
-    }
-    fetch_cached_with_hint(
+    let (_, source) = fetch_cached_with_hint(
         &cache,
         filename,
         asset,
         size,
         "pass OV_IR_DIR or model_dir with local IR weights for offline use",
     )?;
-    Ok((path, "downloaded"))
+    Ok((cache.join(filename), source))
 }
 
 /// Plain-Rust OCR output (GIL-free), assembled into a Python dict afterwards.
@@ -1364,7 +1478,9 @@ impl OcrEngine {
     }
 
     /// Read pre-cropped line images (encoded bytes or uint8 numpy arrays);
-    /// `[{"text", "confidence"}]` in input order.
+    /// `[{"text", "confidence"}]` in input order. Every read is returned:
+    /// `text_score` filtering (including whitespace-only drops) applies only
+    /// to `ocr`/`ocr_batch`.
     #[pyo3(signature = (crops, colorspace="rgb"))]
     fn rec<'py>(
         &self,
@@ -1393,7 +1509,9 @@ impl OcrEngine {
             .collect()
     }
 
-    /// Find text boxes without reading; needs only the detection model.
+    /// Find text boxes without reading; only detection runs per call, but the
+    /// engine still resolves both detection and recognition weights at
+    /// construction.
     /// Mix model sizes in one engine with det_model_size/rec_model_size.
     #[pyo3(signature = (image, colorspace="rgb"))]
     fn det<'py>(
@@ -1738,4 +1856,56 @@ fn faster_paddle(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_ocr_base64, m)?)?;
     m.add_function(wrap_pyfunction!(py_prepare, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_bool_accepts_only_canonical_spellings() {
+        assert_eq!(parse_bool("1"), Some(true));
+        assert_eq!(parse_bool("true"), Some(true));
+        assert_eq!(parse_bool("TRUE"), Some(true));
+        assert_eq!(parse_bool("0"), Some(false));
+        assert_eq!(parse_bool("false"), Some(false));
+        assert_eq!(parse_bool("False"), Some(false));
+        // a typo must not map to `false`; it is ignored (with a warning) instead
+        assert_eq!(parse_bool("yes"), None);
+        assert_eq!(parse_bool(""), None);
+    }
+
+    #[test]
+    fn plausible_weights_flags_truncated_and_garbage() {
+        let mut onnx = vec![0u8; 1024 * 1024];
+        onnx[0] = 0x08;
+        assert!(plausible_weights("det.onnx", &onnx));
+        assert!(!plausible_weights("det.onnx", &onnx[..4096]));
+        assert!(!plausible_weights("det.onnx", &vec![0u8; 1024 * 1024]));
+        let mut xml = Vec::with_capacity(64 * 1024);
+        xml.extend_from_slice(b"<?xml version=\"1.0\"?>");
+        xml.resize(64 * 1024, b' ');
+        assert!(plausible_weights("det.xml", &xml));
+        assert!(!plausible_weights("det.xml", b"<?xml version=\"1.0\"?>"));
+        assert!(plausible_weights("det.bin", &vec![7u8; 256 * 1024]));
+        assert!(!plausible_weights("det.bin", &vec![7u8; 1024]));
+    }
+
+    #[test]
+    fn write_cache_file_replaces_atomically_and_cleans_up() {
+        let dir = std::env::temp_dir().join(format!("faster_paddle_cache_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_cache_file(&dir, "det.onnx", b"first").unwrap();
+        write_cache_file(&dir, "det.onnx", b"second").unwrap();
+        assert_eq!(std::fs::read(dir.join("det.onnx")).unwrap(), b"second");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -228,9 +228,9 @@ impl Engine {
             approximate_gelu,
             det_spin,
             rec_spin,
-            rec_min_width: crate::env_usize("OCR_REC_MIN_WIDTH")
-                .unwrap_or(320)
-                .clamp(64, REC_MAX_W),
+            // provisional; `new_engine` always overwrites it via
+            // `set_input_limits` with the resolved, validated value
+            rec_min_width: 320,
             rec_budget: crate::env_usize("REC_BUDGET").unwrap_or(REC_BATCH_BUDGET),
             det_min_side: std::env::var("OCR_DET_MIN_SIDE")
                 .ok()
@@ -395,7 +395,20 @@ impl Engine {
         let boxes = {
             let outputs = self.det.run(ort::inputs!["x" => tensor])?;
             let (shape, pred) = outputs["fetch_name_0"].try_extract_tensor::<f32>()?;
+            if shape.len() < 4 {
+                return Err(ort::Error::new(format!(
+                    "detector output has {} dims, expected 4",
+                    shape.len()
+                )));
+            }
             let (ph, pw) = (shape[2] as usize, shape[3] as usize);
+            if pred.len() < ph.saturating_mul(pw) {
+                return Err(ort::Error::new(format!(
+                    "detector output tensor has {} values, expected at least {}",
+                    pred.len(),
+                    ph.saturating_mul(pw)
+                )));
+            }
             if dbg {
                 eprintln!(
                     "[dbg]   det ORT infer: {:.3}s",
@@ -576,16 +589,11 @@ fn rec_batch_run(
     let data = &mut worker.input;
     for (bi, &i) in idxs.iter().enumerate() {
         let c = &crops[i];
-        // resized width
-        let resized_w = if img_w >= REC_MAX_W
-            && (REC_H as f64 * c.w as f64 / c.h as f64) as usize > REC_MAX_W
-        {
-            REC_MAX_W
-        } else {
-            let ratio = c.w as f64 / c.h as f64;
-            let rw = (REC_H as f64 * ratio).ceil() as usize;
-            rw.min(img_w).max(1)
-        };
+        // resized width: ceil ratio clamped to the batch tensor width (which
+        // `rec_width` already caps at REC_MAX_W)
+        let resized_w = ((REC_H as f64 * c.w as f64 / c.h as f64).ceil() as usize)
+            .min(img_w)
+            .max(1);
         let base = bi * 3 * plane;
         resize_to_tensor(
             c,
@@ -604,17 +612,31 @@ fn rec_batch_run(
     // per batch; no need to copy them out)
     let outputs = worker.session.run(ort::inputs!["x" => tensor])?;
     let (shape, preds) = outputs["fetch_name_0"].try_extract_tensor::<f32>()?;
+    if shape.len() < 3 {
+        return Err(ort::Error::new(format!(
+            "recognizer output has {} dims, expected 3",
+            shape.len()
+        )));
+    }
     let (t, cls) = (shape[1] as usize, shape[2] as usize);
+    let needed = n
+        .checked_mul(t)
+        .and_then(|v| v.checked_mul(cls))
+        .ok_or_else(|| ort::Error::new("recognizer output shape overflows"))?;
+    if preds.len() < needed {
+        return Err(ort::Error::new(format!(
+            "recognizer output tensor has {} values, expected at least {needed}",
+            preds.len()
+        )));
+    }
     let infer_s = ti.elapsed().as_secs_f64();
     let tc = std::time::Instant::now();
     let mut res = Vec::with_capacity(n);
     for b in 0..n {
-        res.push(ctc_decode(
-            chars,
-            &preds[b * t * cls..(b + 1) * t * cls],
-            t,
-            cls,
-        ));
+        res.push(
+            ctc_decode(chars, &preds[b * t * cls..(b + 1) * t * cls], t, cls)
+                .map_err(ort::Error::new)?,
+        );
     }
     if dbg {
         eprintln!(
@@ -625,7 +647,28 @@ fn rec_batch_run(
     Ok(res)
 }
 
-pub(crate) fn ctc_decode(chars: &[String], logits: &[f32], t: usize, cls: usize) -> (String, f32) {
+pub(crate) fn ctc_decode(
+    chars: &[String],
+    logits: &[f32],
+    t: usize,
+    cls: usize,
+) -> Result<(String, f32), String> {
+    // a custom char_dict.json shorter than the model's class count would
+    // otherwise panic on chars[best]; fail with a fixable message instead
+    if cls > chars.len() {
+        return Err(format!(
+            "recognizer output has {cls} classes but the character dictionary has \
+             {} entries; the model and char_dict.json do not match",
+            chars.len()
+        ));
+    }
+    if logits.len() < t.saturating_mul(cls) {
+        return Err(format!(
+            "recognizer output has {} values, expected at least {}",
+            logits.len(),
+            t.saturating_mul(cls)
+        ));
+    }
     let mut last = usize::MAX;
     let mut s = String::new();
     let mut sum = 0.0f64;
@@ -661,7 +704,7 @@ pub(crate) fn ctc_decode(chars: &[String], logits: &[f32], t: usize, cls: usize)
     } else {
         0.0
     };
-    (s, score)
+    Ok((s, score))
 }
 
 /// Split an aligned recognition stream (one entry per crop, `None` for reads
@@ -990,13 +1033,13 @@ pub(crate) fn db_postprocess(
         .collect()
 }
 
-/// Replicates SortQuadBoxes: top-to-bottom, left-to-right.
+/// Replicates SortQuadBoxes: top-to-bottom, left-to-right. `total_cmp` is a
+/// total order, so a stray NaN coordinate can never panic the sort.
 pub(crate) fn sort_boxes(mut boxes: Vec<[cv::Pt; 4]>) -> Vec<[cv::Pt; 4]> {
     boxes.sort_by(|a, b| {
         a[0].1
-            .partial_cmp(&b[0].1)
-            .unwrap()
-            .then(a[0].0.partial_cmp(&b[0].0).unwrap())
+            .total_cmp(&b[0].1)
+            .then(a[0].0.total_cmp(&b[0].0))
     });
     let n = boxes.len();
     for i in 0..n.saturating_sub(1) {
@@ -1031,7 +1074,7 @@ pub(crate) fn crop_quad(img: &ImageRgb, quad: &[cv::Pt; 4]) -> Option<ImageRgb> 
     let (rect, _side) = cv::min_area_rect(quad);
     // order points like get_minarea_rect_crop: sort by x, pick a/b/c/d
     let mut pts = rect;
-    pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
     let (index_a, index_d) = if pts[1].1 > pts[0].1 { (0, 1) } else { (1, 0) };
     let (index_b, index_c) = if pts[3].1 > pts[2].1 { (2, 3) } else { (3, 2) };
     let ordered = [pts[index_a], pts[index_b], pts[index_c], pts[index_d]];
@@ -1339,7 +1382,7 @@ mod tests {
             [0.1, 0.1, 0.9, 0.9],    // tie B/C -> B
         ];
         let logits: Vec<f32> = rows.iter().flatten().copied().collect();
-        let (text, _) = ctc_decode(&chars, &logits, 2, 4);
+        let (text, _) = ctc_decode(&chars, &logits, 2, 4).unwrap();
         assert_eq!(text, "AB");
     }
 
@@ -1356,8 +1399,34 @@ mod tests {
             [0.1, 0.1, 0.8],    // B
         ];
         let logits: Vec<f32> = rows.iter().flatten().copied().collect();
-        let (text, score) = ctc_decode(&chars, &logits, 4, cls);
+        let (text, score) = ctc_decode(&chars, &logits, 4, cls).unwrap();
         assert_eq!(text, "AB");
         assert!(score > 0.7);
+    }
+
+    #[test]
+    fn ctc_decode_rejects_short_dictionary() {
+        // a custom dict with fewer entries than the model's classes must error
+        // on the offending class instead of panicking
+        let chars = vec!["blank".to_string(), "A".to_string()];
+        let logits = [0.1f32, 0.1, 0.9];
+        let err = ctc_decode(&chars, &logits, 1, 3).unwrap_err();
+        assert!(err.contains("dictionary"), "{err}");
+    }
+
+    #[test]
+    fn ctc_decode_rejects_short_logits() {
+        let chars = vec!["blank".to_string(), "A".to_string()];
+        let err = ctc_decode(&chars, &[0.1, 0.9], 3, 2).unwrap_err();
+        assert!(err.contains("expected at least"), "{err}");
+    }
+
+    #[test]
+    fn sort_boxes_tolerates_nan_coordinates() {
+        let boxes = vec![
+            [(f64::NAN, 1.0), (2.0, 1.0), (2.0, 2.0), (f64::NAN, 2.0)],
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+        ];
+        assert_eq!(sort_boxes(boxes).len(), 2);
     }
 }

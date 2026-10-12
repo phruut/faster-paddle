@@ -560,6 +560,75 @@ def test_cache_dir_arg_and_env_precedence(tmp_path):
     assert os.environ.get("FASTER_PADDLE_CACHE_DIR") == before
 
 
+@requires_ort
+def test_truncated_cache_is_not_trusted(tmp_path, monkeypatch):
+    # any cache file must pass a size/magic plausibility check, so a truncated
+    # one is refetched instead of being trusted forever
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    cache = tmp_path / "cache" / "tiny"
+    cache.mkdir(parents=True)
+    for name in ("det.onnx", "rec.onnx"):
+        (cache / name).write_bytes(b"\x08" + b"\x00" * 4096)
+    monkeypatch.setenv("FASTER_PADDLE_RELEASE_BASE", "http://127.0.0.1:1")
+    try:
+        eng = faster_paddle.OcrEngine(
+            model_size="tiny", threads=2, model_dir=str(empty), cache_dir=str(tmp_path / "cache")
+        )
+    except RuntimeError as e:
+        # code-only wheel: the truncated cache was rejected and refetched
+        assert "failed to download" in str(e), e
+    else:
+        # bundled-all wheel: bundled weights shadow the cache
+        assert eng.config["det_source"] == "bundled"
+
+
+def test_model_size_validated_even_when_overridden(tmp_path, monkeypatch):
+    # a bogus model_size must fail even when both per-side sizes override it,
+    # before any weight resolution
+    monkeypatch.setenv("FASTER_PADDLE_RELEASE_BASE", "http://127.0.0.1:1")
+    with pytest.raises(ValueError, match="unknown model_size"):
+        faster_paddle.OcrEngine(
+            model_size="bogus", det_model_size="tiny", rec_model_size="tiny",
+            model_dir=str(tmp_path), cache_dir=str(tmp_path),
+        )
+
+
+def test_knob_validation_precedes_download(tmp_path, monkeypatch):
+    # with a dead release host, an invalid knob must still raise ValueError:
+    # knobs are validated before weight resolution can touch the network
+    monkeypatch.setenv("FASTER_PADDLE_RELEASE_BASE", "http://127.0.0.1:1")
+    with pytest.raises(ValueError, match="det_box_thresh"):
+        faster_paddle.OcrEngine(
+            model_size="tiny", det_box_thresh=1.5,
+            model_dir=str(tmp_path), cache_dir=str(tmp_path),
+        )
+
+
+def test_rec_min_width_env_validated_like_arg(monkeypatch):
+    # the env override gets the same range check as the argument (no silent clamp)
+    for value in ("32", "9999"):
+        monkeypatch.setenv("OCR_REC_MIN_WIDTH", value)
+        with pytest.raises(ValueError, match="rec_min_width"):
+            faster_paddle.OcrEngine(model_size="tiny")
+
+
+@requires_ort
+def test_short_custom_dict_errors_instead_of_panicking(tmp_path):
+    # a char_dict.json shorter than the model's class count must raise, not
+    # crash the interpreter on an out-of-bounds class index
+    import shutil
+
+    tiny = tmp_path / "tiny"
+    tiny.mkdir()
+    for name in ("det.onnx", "rec.onnx"):
+        shutil.copy(os.path.join(MODELS_DIR, "tiny", name), tiny / name)
+    (tiny / "char_dict.json").write_text('["a", "b", "c", "d", "e"]')
+    eng = faster_paddle.OcrEngine(model_size="tiny", threads=2, model_dir=str(tmp_path))
+    with pytest.raises(RuntimeError, match="dictionary"):
+        eng.ocr(_small())
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

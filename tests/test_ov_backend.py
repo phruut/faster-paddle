@@ -72,6 +72,17 @@ def test_ov_deterministic():
     assert e.ocr(data)["text"] == first
 
 
+def test_explicit_model_dir_beats_ov_ir_dir(tmp_path, monkeypatch):
+    # constructor beats env: an explicit model_dir wins over OV_IR_DIR
+    ir_dir = os.environ.get("OV_IR_DIR")
+    if not ir_dir or not os.path.isfile(os.path.join(ir_dir, "tiny", "det.xml")):
+        pytest.skip("no local OV_IR_DIR with tiny IR weights to reuse")
+    monkeypatch.setenv("OV_IR_DIR", str(tmp_path))  # empty; must not be used
+    eng = faster_paddle.OcrEngine(backend="ov", model_size="tiny", model_dir=ir_dir)
+    assert eng.config["model_dir"] == ir_dir
+    assert eng.config["det_source"] == "local"
+
+
 def test_ov_only_wheel_has_no_ort():
     """The OpenVINO wheel ships OpenVINO only; ORT builds never report "ov" as
     their default backend."""

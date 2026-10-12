@@ -19,8 +19,8 @@ recipes live in [usage.md](usage.md).
 | `OcrEngine(...)` | Construct a reusable engine (see below for every argument). |
 | `OcrEngine.ocr(image, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb") -> dict` | OCR encoded image bytes or a uint8 numpy array. |
 | `OcrEngine.ocr_batch(images, *, batch_size=4, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb") -> list[dict]` | OCR multiple encoded images/arrays; results preserve input order. |
-| `OcrEngine.rec(crops, colorspace="rgb") -> list[{"text": str, "confidence": float}]` | Recognize pre-cropped line images (bytes or arrays), skipping detection; input order preserved. |
-| `OcrEngine.det(image, colorspace="rgb") -> list[{"topLeftCoord": (x1, y1), "bottomRightCoord": (x2, y2)}]` | Detect text boxes without recognizing; needs only the detection model. |
+| `OcrEngine.rec(crops, colorspace="rgb") -> list[{"text": str, "confidence": float}]` | Recognize pre-cropped line images (bytes or arrays), skipping detection; input order preserved. Every read is returned: `text_score` filtering applies only to `ocr`/`ocr_batch`. |
+| `OcrEngine.det(image, colorspace="rgb") -> list[{"topLeftCoord": (x1, y1), "bottomRightCoord": (x2, y2)}]` | Detect text boxes without recognizing; only detection runs per call, but the engine still loads both model sets at construction. |
 | `OcrEngine.ocr_base64(image_base64, resize=False, denoise=False, deskew=False, binarize=False) -> dict` | OCR a base64 image string. |
 | `OcrEngine.prepare(image, resize=False, denoise=False, deskew=False, binarize=False, colorspace="rgb", return_array=False) -> bytes` | Preprocess only; PNG bytes by default, `(H, W, 3)` numpy array with `return_array=True`. |
 | `OcrEngine.config` | Read-only dict of resolved settings (see Diagnostics). |
@@ -66,9 +66,9 @@ OcrEngine(
 | `det_box_thresh` | 0.40 tiny, 0.45 small/medium | Minimum box score for a detected box. |
 | `det_unclip_ratio` | `1.4` | Box expansion ratio (`unclip`). |
 | `det_max_candidates` | `3000` | Maximum detection boxes kept before scoring. |
-| `text_score` | `0.0` (keep all) | Drop reads whose confidence is below this. |
+| `text_score` | `0.0` (keep all) | Drop reads whose confidence is below this. Applies to `ocr`/`ocr_batch` only; when set above zero, whitespace-only reads are dropped as well. `rec` never filters. |
 | `det_use_dilation` | `False` | 2x2 OR-dilate the detection mask before connected components. Merges components with small gaps between them. |
-| `backend` | wheel's runtime | `"ort"` (default wheel) or `"ov"` (OpenVINO wheel). Passing a backend the wheel wasn't built with raises a clear error. `"ov"` reads IR weights (`OV_IR_DIR` or `model_dir`) and always uses singleton `rec_batch`. |
+| `backend` | wheel's runtime | `"ort"` (default wheel) or `"ov"` (OpenVINO wheel). Passing a backend the wheel wasn't built with raises a clear error. `"ov"` reads IR weights: explicit `model_dir` beats `OV_IR_DIR`, which beats `FASTER_PADDLE_MODEL_DIR`; always uses singleton `rec_batch`. |
 
 ## Environment overrides
 
@@ -101,7 +101,7 @@ autotuning; benchmark other CPU architectures with
 | `FASTER_PADDLE_MODEL_DIR` | default `model_dir` |
 | `FASTER_PADDLE_CACHE_DIR` | default `cache_dir` |
 | `FASTER_PADDLE_RELEASE_BASE` | base URL for model downloads (local mirror) |
-| `OV_IR_DIR` | fallback-free IR weight directory for `backend="ov"` |
+| `OV_IR_DIR` | IR weight directory for `backend="ov"` (an explicit `model_dir` argument wins over it) |
 
 ## Parallelism
 
