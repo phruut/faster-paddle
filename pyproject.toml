@@ -29,6 +29,9 @@ Repository = "https://github.com/phruut/faster-paddle"
 [tool.maturin]
 module-name = "faster_paddle"
 python-source = "python"
+# Wheels are pyo3 extension modules. This is intentionally not a default Cargo
+# feature so `cargo test` links libpython; note maturin ignores this list when
+# a build passes `--features` on the CLI (CI repeats it there explicitly).
 features = ["pyo3/extension-module"]
 strip = true
 # OpenVINO wheel (`--no-default-features --features openvino-backend`):

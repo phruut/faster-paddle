@@ -108,7 +108,7 @@ OpenVINO backend only.
 | `OV_NUM_STREAMS` | OpenVINO streams for the compiled models (OV builds; default 1 for the detector and `min(pool, 4)` for recognition) |
 | `FASTER_PADDLE_MODEL_DIR` | default `model_dir` |
 | `FASTER_PADDLE_CACHE_DIR` | default `cache_dir` |
-| `FASTER_PADDLE_RELEASE_BASE` | download base URL (local mirror). Assets are fetched from `{base}/v{VERSION}/{asset}`, e.g. `ppocrv6_tiny_det.onnx` or `ppocrv6_tiny_det.xml`; a trailing `/` is ignored. |
+| `FASTER_PADDLE_RELEASE_BASE` | download base URL (local mirror). Assets are fetched from `{base}/{models tag}/{asset}` (default tag `models-v1`), e.g. `ppocrv6_tiny_det.onnx` or `ppocrv6_tiny_det.xml`; a trailing `/` is ignored. |
 | `OV_IR_DIR` | IR weight directory for `backend="ov"` (an explicit `model_dir` argument wins over it) |
 
 ## Parallelism

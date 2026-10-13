@@ -22,6 +22,9 @@ from PIL import Image
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURE = os.path.join(HERE, "fixtures", "document.png")  # two-pane UI screenshot
 MODELS_DIR = os.path.abspath(os.path.join(HERE, "..", "models"))
+# Release tag the runtime downloads weights from; keep in sync with MODELS_TAG
+# in src/lib.rs (the weight release is shared by every library version).
+MODELS_TAG = "models-v1"
 
 # Wheels ship exactly one backend: "ort" (default) or "ov" (faster-paddle-openvino).
 # Older builds predate the module attribute and always include ORT.
@@ -629,12 +632,15 @@ def test_cache_dir_arg_and_env_precedence(tmp_path):
     import shutil
     from unittest.mock import patch
 
+    def seed(directory):
+        tiny = directory / "tiny"
+        tiny.mkdir(parents=True)
+        shutil.copy(os.path.join(MODELS_DIR, "tiny", "det.onnx"), tiny / "det.onnx")
+        shutil.copy(os.path.join(MODELS_DIR, "tiny", "rec.onnx"), tiny / "rec.onnx")
+
     # A custom cache hit needs no network: seed it with the repo weights.
     cache = tmp_path / "cache"
-    tiny = cache / "tiny"
-    tiny.mkdir(parents=True)
-    shutil.copy(os.path.join(MODELS_DIR, "tiny", "det.onnx"), tiny / "det.onnx")
-    shutil.copy(os.path.join(MODELS_DIR, "tiny", "rec.onnx"), tiny / "rec.onnx")
+    seed(cache)
     # An explicit empty model_dir keeps FASTER_PADDLE_MODEL_DIR (set by the CI
     # wheel jobs) from shadowing the cache and resolves to a local miss; a
     # code-only wheel must then report 'cached'. A bundled-all wheel resolves
@@ -655,12 +661,15 @@ def test_cache_dir_arg_and_env_precedence(tmp_path):
         eng = faster_paddle.OcrEngine(model_size="tiny", threads=2, model_dir=str(empty))
         assert eng.config["cache_dir"] == str(cache)
         assert eng.config["det_source"] in expected_sources
-        # explicit arg beats the env var
+        # explicit arg beats the env var; seed its own cache so this stays
+        # offline (an empty cache_dir would force a release download)
         other = tmp_path / "other"
+        seed(other)
         eng = faster_paddle.OcrEngine(
             model_size="tiny", threads=2, model_dir=str(empty), cache_dir=str(other)
         )
         assert eng.config["cache_dir"] == str(other)
+        assert eng.config["det_source"] in expected_sources
     assert os.environ.get("FASTER_PADDLE_CACHE_DIR") == before
 
 
@@ -720,7 +729,7 @@ def test_mirror_download_lands_in_cache_and_is_reused(tmp_path, monkeypatch):
     (no temp residue), a second engine with the mirror unreachable reuses them
     (`cached`), and a plausible-size but wrong-magic cache entry is refetched
     instead of trusted."""
-    asset_root = tmp_path / "mirror" / ("v" + faster_paddle.__version__)
+    asset_root = tmp_path / "mirror" / MODELS_TAG
     asset_root.mkdir(parents=True)
     served = {}
     for local_name, asset in (

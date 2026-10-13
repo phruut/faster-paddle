@@ -38,14 +38,16 @@ jobs:
       # Self-contained test wheel: bundles every size so the suite stays
       # offline and never depends on release assets. The platform jobs below
       # cover the code-only + model_dir path; `download-check` covers downloads.
-      - run: maturin build --release --locked --features bundled-all --out dist-test
+      # pyo3/extension-module: passed explicitly because maturin ignores
+      # pyproject's feature list whenever the CLI passes --features.
+      - run: maturin build --release --locked --features bundled-all,pyo3/extension-module --out dist-test
       - run: python -m pip install dist-test/*.whl
       - run: python -m pytest tests -q
 
-  # The runtime downloads assets from `releases/download/v{VERSION}` where
-  # VERSION is the compiled `CARGO_PKG_VERSION`, so a tag that disagrees with
-  # the manifests would release/validate the wrong artifacts (see
-  # download-check). Also keeps Cargo.toml and pyproject.toml in sync on PRs.
+  # Keeps Cargo.toml and pyproject.toml in sync on PRs, and on tags checks the
+  # tag matches the manifest version: the release job attaches wheels under that
+  # version tag, so a mismatched tag would publish mislabeled wheels. Model
+  # weights live in their own pinned release (see MODELS_TAG in src/lib.rs).
   version-check:
     name: Manifest versions agree
     runs-on: ubuntu-latest
@@ -164,7 +166,9 @@ jobs:
           # plugins.xml + plugin adjacent. Repair would relocate the linked
           # libs into .libs/ (hashed names), stranding plugins.xml/the dlopen'd
           # CPU plugin, which it can't see).
-          args: --release --locked --no-default-features --features openvino-backend --auditwheel skip --out dist
+          # pyo3/extension-module must be repeated: maturin ignores pyproject's
+          # feature list when the CLI passes --features.
+          args: --release --locked --no-default-features --features openvino-backend,pyo3/extension-module --auditwheel skip --out dist
           sccache: "true"
           manylinux: "2_34"
           before-script-linux: |
@@ -196,7 +200,10 @@ jobs:
           OCR_THREADS: "2"
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
           FASTER_PADDLE_MODEL_DIR: ${{ github.workspace }}/models
-          OV_IR_DIR: ${{ runner.temp }}/ir-test
+          OV_IR_DIR: ${{ github.workspace }}/models
+          # IR is converted into the checkout's models/ (not a temp dir): the
+          # shared suite passes model_dir=models, which now beats OV_IR_DIR, and
+          # the ORT resolver ignores the .xml/.bin files sitting beside .onnx.
         run: |
           python scripts/convert_ir.py "$OV_IR_DIR" tiny small
           python -m pip install dist/*.whl
@@ -298,7 +305,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --locked --no-default-features --features openvino-backend --out dist
+          args: --release --locked --no-default-features --features openvino-backend,pyo3/extension-module --out dist
           sccache: "true"
       - name: Test installed OV wheel (OpenVINO only)
         shell: bash
@@ -306,7 +313,10 @@ jobs:
           OCR_THREADS: "2"
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
           FASTER_PADDLE_MODEL_DIR: ${{ github.workspace }}/models
-          OV_IR_DIR: ${{ runner.temp }}/ir-test
+          OV_IR_DIR: ${{ github.workspace }}/models
+          # IR is converted into the checkout's models/ (not a temp dir): the
+          # shared suite passes model_dir=models, which now beats OV_IR_DIR, and
+          # the ORT resolver ignores the .xml/.bin files sitting beside .onnx.
         run: |
           # Drop the build-time OV_DIR PATH entry: the wheel vendors its own
           # runtime, so the tests must pass without pip's OpenVINO DLLs.
@@ -414,7 +424,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --locked --no-default-features --features openvino-backend --out dist
+          args: --release --locked --no-default-features --features openvino-backend,pyo3/extension-module --out dist
           sccache: "true"
       - name: Test installed OV wheel (OpenVINO only)
         shell: bash
@@ -422,7 +432,10 @@ jobs:
           OCR_THREADS: "2"
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
           FASTER_PADDLE_MODEL_DIR: ${{ github.workspace }}/models
-          OV_IR_DIR: ${{ runner.temp }}/ir-test
+          OV_IR_DIR: ${{ github.workspace }}/models
+          # IR is converted into the checkout's models/ (not a temp dir): the
+          # shared suite passes model_dir=models, which now beats OV_IR_DIR, and
+          # the ORT resolver ignores the .xml/.bin files sitting beside .onnx.
         run: |
           # GITHUB_ENV carried DYLD_LIBRARY_PATH here from "Locate native
           # deps" (needed only by the build's openvino-finder probe). Drop it:
@@ -486,65 +499,15 @@ jobs:
           name: wheels-sdist
           path: dist
 
-  # The default wheel bundles no model weights; every size ships as a GitHub
-  # Release asset and the library downloads it on demand on first use
-  # (see model_bytes in src/lib.rs). Asset names must match the runtime URL.
-  # The OV wheel's IR weights ride along the same way (see ir_file_resolved):
-  # converted here from the same .onnx files with the pinned OV version, so
-  # runtime numerics match what CI tested.
-  model-assets:
-    name: Upload model weights to release
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: version-check
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-      - name: Stage assets (names must match the runtime download URL)
-        run: |
-          cp models/tiny/det.onnx ppocrv6_tiny_det.onnx
-          cp models/tiny/rec.onnx ppocrv6_tiny_rec.onnx
-          cp models/small/det.onnx ppocrv6_small_det.onnx
-          cp models/small/rec.onnx ppocrv6_small_rec.onnx
-          cp models/medium/det.onnx ppocrv6_medium_det.onnx
-          cp models/medium/rec.onnx ppocrv6_medium_rec.onnx
-          python -m pip install "openvino==${{ env.OV_VERSION }}"
-          python scripts/convert_ir.py . tiny small medium --flat
-          ls -la ppocrv6_*
-      - uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            ppocrv6_tiny_det.onnx
-            ppocrv6_tiny_rec.onnx
-            ppocrv6_small_det.onnx
-            ppocrv6_small_rec.onnx
-            ppocrv6_medium_det.onnx
-            ppocrv6_medium_rec.onnx
-            ppocrv6_tiny_det.xml
-            ppocrv6_tiny_det.bin
-            ppocrv6_tiny_rec.xml
-            ppocrv6_tiny_rec.bin
-            ppocrv6_small_det.xml
-            ppocrv6_small_det.bin
-            ppocrv6_small_rec.xml
-            ppocrv6_small_rec.bin
-            ppocrv6_medium_det.xml
-            ppocrv6_medium_det.bin
-            ppocrv6_medium_rec.xml
-            ppocrv6_medium_rec.bin
-
-  # Tag-only: proves the uploaded assets are fetchable under the exact names
-  # the runtime downloads (guards against misnamed/missing assets). Runs after
-  # both the wheel build and the asset upload, with no local weights present.
+  # Tag-only: proves the pinned model-weights release (see MODELS_TAG in
+  # src/lib.rs, published by the Models workflow) serves the exact asset names
+  # the runtime downloads. No checkout and no local weights: constructing an
+  # engine must fetch both files and report `downloaded`.
   download-check:
     name: Check on-demand model download
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [version-check, linux, model-assets]
+    needs: [version-check, linux]
     steps:
       - uses: actions/download-artifact@v7
         with:
@@ -567,14 +530,14 @@ jobs:
           print('download OK:', cfg['det_model_size'], cfg['det_source'], cfg['rec_source'])
           "
 
-  # Tag-only: proves the uploaded IR assets are fetchable under the exact names
-  # the OV backend downloads (mirrors download-check). No checkout, no local
-  # weights: constructing backend="ov" must pull all four IR files.
+  # Tag-only: proves the pinned model-weights release serves the exact IR asset
+  # names the OV backend downloads (mirrors download-check). No checkout, no
+  # local weights: constructing backend="ov" must pull all four IR files.
   ov-download-check:
     name: Check on-demand IR download (OV wheel)
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [version-check, linux-ov, model-assets]
+    needs: [version-check, linux-ov]
     steps:
       - uses: actions/download-artifact@v7
         with:
@@ -607,8 +570,9 @@ jobs:
   # Tag-only: attach the prebuilt wheels (+ sdist) to the GitHub release so
   # consumers can install without Rust/MSVC, e.g.
   #   uv pip install https://github.com/phruut/faster-paddle/releases/download/v1.2.2/<wheel-file>
-  # Gated on both download checks so the two softprops/action-gh-release
-  # writers (model-assets, then this) never race each other on the same tag.
+  # Gated on both download checks so the wheels only publish once they and the
+  # pinned model-weights release are validated. Version releases carry wheels
+  # only; weights live in the separate Models release.
   release:
     name: Attach wheels to release
     runs-on: ubuntu-latest

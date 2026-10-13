@@ -1,0 +1,81 @@
+name: Models
+
+# Manual publisher for the shared model-weights release. The runtime fetches
+# assets from `releases/download/{MODELS_TAG}/...` (see MODELS_TAG in
+# src/lib.rs), so this release is created once and reused by every library
+# version; version tags published by CI carry wheels only. Re-run this
+# whenever models/ or the staged asset set changes.
+on:
+  workflow_dispatch:
+
+# Serialize uploads so a manual re-run can't race a previous one on the same
+# release. (Tag creation through the Releases API does not emit push events,
+# so this never triggers the main CI workflow.)
+concurrency:
+  group: models-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  # Must match OV_VERSION in CI.yml: the IR weights and the OV wheels' vendored
+  # runtime come from ONE OpenVINO version, so fetched numerics match CI.
+  OV_VERSION: "2026.4.1"
+
+jobs:
+  publish:
+    name: Upload model weights
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Resolve the models tag from src/lib.rs
+        id: tag
+        run: |
+          tag=$(sed -n 's/.*const MODELS_TAG.*"\([^"]*\)".*/\1/p' src/lib.rs)
+          if [ -z "$tag" ]; then
+            echo "::error::could not read MODELS_TAG from src/lib.rs"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "publishing weights to $tag"
+      - name: Stage assets (names must match the runtime download URL)
+        run: |
+          cp models/tiny/det.onnx ppocrv6_tiny_det.onnx
+          cp models/tiny/rec.onnx ppocrv6_tiny_rec.onnx
+          cp models/small/det.onnx ppocrv6_small_det.onnx
+          cp models/small/rec.onnx ppocrv6_small_rec.onnx
+          cp models/medium/det.onnx ppocrv6_medium_det.onnx
+          cp models/medium/rec.onnx ppocrv6_medium_rec.onnx
+          python -m pip install "openvino==${{ env.OV_VERSION }}"
+          python scripts/convert_ir.py . tiny small medium --flat
+          ls -la ppocrv6_*
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Model weights (${{ steps.tag.outputs.tag }})
+          # Weights are not a software release: keep the "Latest" badge on the
+          # version releases. Asset download URLs are unaffected.
+          prerelease: true
+          files: |
+            ppocrv6_tiny_det.onnx
+            ppocrv6_tiny_rec.onnx
+            ppocrv6_small_det.onnx
+            ppocrv6_small_rec.onnx
+            ppocrv6_medium_det.onnx
+            ppocrv6_medium_rec.onnx
+            ppocrv6_tiny_det.xml
+            ppocrv6_tiny_det.bin
+            ppocrv6_tiny_rec.xml
+            ppocrv6_tiny_rec.bin
+            ppocrv6_small_det.xml
+            ppocrv6_small_det.bin
+            ppocrv6_small_rec.xml
+            ppocrv6_small_rec.bin
+            ppocrv6_medium_det.xml
+            ppocrv6_medium_det.bin
+            ppocrv6_medium_rec.xml
+            ppocrv6_medium_rec.bin

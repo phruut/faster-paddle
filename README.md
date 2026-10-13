@@ -14,9 +14,10 @@ inference. One runtime per wheel, no Python inference packages.
 - Multi-image OCR with `ocr_batch`: ordered results and shared recognition work
   across pages. [Batch usage](docs/usage.md#multiple-images).
 - Code-only default: the wheel bundles no model weights. Each size is loaded
-  from `model_dir`, the local cache, or a one-time download from the GitHub
-  release. Build with `--features bundled-tiny/small/medium/all` for a
-  self-contained wheel with the weights embedded.
+  from `model_dir`, the local cache, or a one-time download from the pinned
+  model-weights release (`models-v1`, shared across library versions). Build
+  with `--features bundled-tiny/small/medium/all` for a self-contained wheel
+  with the weights embedded.
 - Three model sizes: `tiny` (default, fastest), `small`, and `medium` (higher
   accuracy). Split-stage entry points too: boxes only with `det`, recognition
   only with `rec`, and mixed per-stage sizes
@@ -72,8 +73,9 @@ glibc floors: x86-64 needs glibc 2.34+ (ONNX Runtime), arm64 needs 2.28+.
 Both are self-contained: no Python `onnxruntime`/`openvino` package, no
 `PATH` setup, no second install. Model weights download on first use either
 way: ONNX weights for `"ort"`, IR weights (`ppocrv6_{size}_{det,rec}.xml`/`.bin`
-release assets) for `"ov"`. The backend defaults to the wheel's runtime and
-can be passed explicitly when the build offers more than one:
+from the same pinned weights release) for `"ov"`. The backend defaults to the
+wheel's runtime and can be passed explicitly when the build offers more than
+one:
 
 ```python
 engine = OcrEngine(model_size="small")                 # ONNX Runtime (default wheel)
@@ -141,8 +143,10 @@ variant of the text (see [below](#text-vs-structured_text)).
 
 A size that isn't built into your wheel is downloaded once on first use (that
 one time needs network) and cached under your user cache dir
-(`.../faster_paddle/v<VERSION>/{tiny,small,medium}/`). Override the cache root
-with `cache_dir` (or `FASTER_PADDLE_CACHE_DIR`); an override stores
+(`.../faster_paddle/v<VERSION>/{tiny,small,medium}/`). Weights live in their
+own pinned release (`models-v1`), separate from the version releases that
+carry the wheels. Override the cache root with `cache_dir` (or
+`FASTER_PADDLE_CACHE_DIR`); an override stores
 `{cache_dir}/{tiny,small,medium}/` unversioned so upgrades reuse the files.
 Point the engine at local weights to stay fully offline:
 

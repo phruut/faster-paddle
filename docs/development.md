@@ -28,7 +28,7 @@ vs PaddlePaddle floating-point numerics, not the algorithm.
 
 The PP-OCRv6 ONNX models are exported with `paddle2onnx`. The OpenVINO wheel's
 IR weights are converted from those same files with the pinned OpenVINO
-version (see the CI `model-assets` job), so both runtimes read equivalent
+version (see the `Models` workflow), so both runtimes read equivalent
 weights.
 
 ## Building from source

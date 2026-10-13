@@ -66,7 +66,8 @@ fn main() {
 /// tracks the OV release; Windows names are unversioned).
 struct OvLib {
     prefix: &'static str,
-    /// The core library, probed for the `ov_core_set_properties` symbol.
+    /// The C API library, probed for the `ov_core_set_properties` symbol. The
+    /// symbol lives in `openvino_c` (the C API), not the C++ `openvino` core.
     core: bool,
 }
 
@@ -142,10 +143,9 @@ fn ov_lib_patterns(target_os: &str, target_arch: &str) -> Option<Vec<OvLib>> {
     let mut libs: Vec<OvLib> = common
         .iter()
         .copied()
-        .enumerate()
-        .map(|(i, prefix)| OvLib {
+        .map(|prefix| OvLib {
             prefix,
-            core: i == 0,
+            core: prefix.contains("openvino_c"),
         })
         .collect();
     libs.push(OvLib {
@@ -360,7 +360,7 @@ fn stage_ov_libs(target_os: &str, target_arch: &str) {
     }
 }
 
-/// Fail the build if the staged core runtime does not export the
+/// Fail the build if the staged C API runtime does not export the
 /// non-variadic `ov_core_set_properties` entry point (OpenVINO 2026.x API).
 fn verify_core_symbol(path: &Path, target_os: &str) {
     let (args, symbol): (&[&str], &str) = match target_os {

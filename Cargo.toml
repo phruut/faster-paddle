@@ -29,9 +29,19 @@ bundled-all = ["bundled-tiny", "bundled-small", "bundled-medium"]
 # backend). Requires OpenVINO native libs at build time (see src/ov_backend.rs);
 # default builds never compile it.
 openvino-backend = ["dep:openvino", "dep:openvino-sys"]
+# Extension-module linkage: skips libpython on Linux/macOS. Deliberately NOT a
+# default feature, because `cargo test` needs a test binary that links libpython
+# (pyo3 only links it when extension-module is off). Wheel builds enable it:
+# maturin reads `features = ["pyo3/extension-module"]` from pyproject.toml, and
+# CI invocations that pass their own `--features` must repeat it explicitly
+# (maturin ignores the pyproject list whenever the CLI provides features).
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
+# `extension-module` is a crate feature here (see [features]), not a default
+# dependency feature: tests must link libpython, wheels must not. The abi3
+# floor stays always-on so abi3 and extension-module cannot drift apart.
+pyo3 = { version = "0.23", features = ["abi3-py38"] }
 numpy = "0.23"
 # default features minus `tls-native` (which pulls openssl-sys and breaks
 # dependency-free cross-platform wheel builds); use rustls for the model

@@ -200,8 +200,12 @@ const MEDIUM_DET: &[u8] = include_bytes!("../models/medium/det.onnx");
 const MEDIUM_REC: &[u8] = include_bytes!("../models/medium/rec.onnx");
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-// Release hosting the downloadable weights (see the `model-assets` CI job).
+// Release hosting the downloadable weights, published by the manual Models
+// workflow (.github/workflows/models.yml). The tag is deliberately NOT tied to
+// the crate version: weight assets are shared by every library version, so
+// version releases stay wheels-only. Bump this tag if weights ever change.
 const RELEASE_BASE: &str = "https://github.com/phruut/faster-paddle/releases/download";
+const MODELS_TAG: &str = "models-v1";
 
 fn parse_dict(json: &str) -> Vec<String> {
     serde_json::from_str(json).expect("embedded char_dict.json is valid")
@@ -289,8 +293,8 @@ fn local_dict(dir: Option<&std::path::Path>, size: &str) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-/// Release asset names must match the files attached to the GitHub release
-/// (see the `model-assets` CI job).
+/// Release asset names must match the files in the pinned weights release
+/// (published by the `Models` workflow).
 #[cfg(feature = "ort-backend")]
 fn det_asset(size: &str) -> &'static str {
     match size {
@@ -351,8 +355,8 @@ fn resolve_rec(
 
 /// Release host for one-time model downloads. Overridable for testing via
 /// `FASTER_PADDLE_RELEASE_BASE` (e.g. a local mirror); production uses the
-/// GitHub release. Trailing slashes are trimmed so the `{base}/v{VERSION}/...`
-/// URL never gains a double slash.
+/// GitHub release. Trailing slashes are trimmed so the
+/// `{base}/{MODELS_TAG}/...` URL never gains a double slash.
 fn release_base() -> String {
     std::env::var("FASTER_PADDLE_RELEASE_BASE")
         .ok()
@@ -518,7 +522,7 @@ fn fetch_cached_with_hint(
     }
     std::fs::create_dir_all(cache_dir)
         .map_err(|e| PyRuntimeError::new_err(format!("cannot create cache dir: {e}")))?;
-    let url = format!("{}/v{VERSION}/{asset}", release_base());
+    let url = format!("{}/{MODELS_TAG}/{asset}", release_base());
     let resp = download_agent().get(&url).call().map_err(|e| {
         PyRuntimeError::new_err(format!(
             "failed to download {size} model from {url}: {e}; {offline_hint}"
@@ -1107,9 +1111,9 @@ fn new_ov_engine(
     Ok((engine, det_src, rec_src, dir_str, cache_str))
 }
 
-/// IR release asset names mirror the ONNX ones, with IR extensions. Attached
-/// to the GitHub release by the `model-assets` CI job; downloaded on demand
-/// exactly like ONNX weights.
+/// IR release asset names mirror the ONNX ones, with IR extensions. Published
+/// to the pinned weights release by the `Models` workflow; downloaded on
+/// demand exactly like ONNX weights.
 #[cfg(feature = "openvino-backend")]
 fn ir_det_assets(size: &str) -> (&'static str, &'static str) {
     match size {
