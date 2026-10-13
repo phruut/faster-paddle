@@ -1,7 +1,6 @@
 # faster-paddle fork
 
-Fork of [cnmoro/faster-paddle](https://github.com/cnmoro/faster-paddle), maintained by
-[phruut](https://github.com/phruut).
+Fork of [cnmoro/faster-paddle](https://github.com/cnmoro/faster-paddle).
 
 **Fast, CPU-only OCR in Rust with Python bindings**: a self-contained
 reimplementation of PaddleOCR's PP-OCRv6 detection + recognition pipeline with

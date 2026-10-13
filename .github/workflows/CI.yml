@@ -1,14 +1,26 @@
 name: CI
 
+# Branch pushes are a cheap smoke gate: only `tests` and `version-check` run.
+# The full wheel matrix is gated on PRs, manual dispatch, and tag pushes (see
+# the `if` on the platform jobs). Path filters are not evaluated for tag
+# pushes, so releases always build everything; docs-only pushes run nothing.
 on:
   push:
     branches: [main, master]
     tags: ["v*"]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".research/**"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".research/**"
   workflow_dispatch:
 
 # Serialize runs that share a ref so duplicate tag pushes don't race the
-# model-asset upload.
+# release upload.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: false
@@ -73,6 +85,7 @@ jobs:
           esac
 
   linux:
+    if: github.event_name != 'push' || github.ref_type == 'tag'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -135,6 +148,7 @@ jobs:
   # build.rs, and it ships under the faster-paddle-openvino distribution name
   # so both wheels coexist as release assets.
   linux-ov:
+    if: github.event_name != 'push' || github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -222,6 +236,7 @@ jobs:
           path: dist
 
   windows:
+    if: github.event_name != 'push' || github.ref_type == 'tag'
     runs-on: windows-latest
     strategy:
       matrix:
@@ -264,6 +279,7 @@ jobs:
   # (openvino for the runtime, libclang for bindgen); the wheel itself stays
   # self-contained via build.rs vendoring. Ships as faster-paddle-openvino.
   windows-ov:
+    if: github.event_name != 'push' || github.ref_type == 'tag'
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:
@@ -338,6 +354,7 @@ jobs:
           path: dist
 
   macos:
+    if: github.event_name != 'push' || github.ref_type == 'tag'
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -382,6 +399,7 @@ jobs:
   # distribution name. Linux/macOS .so/.dylib names in build.rs are verified
   # against the pinned pip layout; this job is the release gate for them.
   macos-ov:
+    if: github.event_name != 'push' || github.ref_type == 'tag'
     runs-on: macos-14      # apple silicon
     timeout-minutes: 45
     strategy:
@@ -486,6 +504,7 @@ jobs:
           path: dist
 
   sdist:
+    if: github.event_name != 'push' || github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
