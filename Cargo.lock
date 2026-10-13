@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "faster_paddle"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "base64",
  "dirs",

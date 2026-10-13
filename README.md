@@ -39,12 +39,12 @@ the exact release you validated (the URLs are version-pinned, and release
 assets stay in place) and install its file directly:
 
 ```bash
-uv pip install https://github.com/phruut/faster-paddle/releases/download/v1.2.1/<wheel-file>
+uv pip install https://github.com/phruut/faster-paddle/releases/download/v1.2.2/<wheel-file>
 # or
-pip install https://github.com/phruut/faster-paddle/releases/download/v1.2.1/<wheel-file>
+pip install https://github.com/phruut/faster-paddle/releases/download/v1.2.2/<wheel-file>
 ```
 
-Replace `v1.2.1` with the release you want; the [releases page](https://github.com/phruut/faster-paddle/releases)
+Replace `v1.2.2` with the release you want; the [releases page](https://github.com/phruut/faster-paddle/releases)
 lists the available wheel files. Source builds are the fallback for platforms
 without a wheel; releases before v1.1.1 have no prebuilt wheels at all.
 
@@ -54,8 +54,8 @@ inference runtime each, so the filenames differ:
 
 | wheel file | inference | download | pick it when |
 |---|---|---|---|
-| `faster_paddle-1.2.1-...-win_amd64.whl` | ONNX Runtime, linked in | ~9 MB | you want the minimal install |
-| `faster_paddle_openvino-1.2.1-...-win_amd64.whl` | OpenVINO, DLLs bundled | ~20 MB (~65 MB installed) | you want lower latency (not always) |
+| `faster_paddle-1.2.2-...-win_amd64.whl` | ONNX Runtime, linked in | ~9 MB | you want the minimal install |
+| `faster_paddle_openvino-1.2.2-...-win_amd64.whl` | OpenVINO, DLLs bundled | ~20 MB (~65 MB installed) | you want lower latency (not always) |
 
 Wheel coverage per platform:
 
